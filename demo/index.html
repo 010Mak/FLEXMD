@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>mmdfled space‑fill</title>
+<style>
+  :root { --bg:#121418; --panel:#161a20; --text:#e6e8ea; --mut:#9aa4ae; --edge:#202632; }
+  html,body { height:100%; margin:0; background:var(--bg); color:var(--text); font:14px/1.35 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  #canvas { position:absolute; inset:0; display:block; }
+  #ui { position:fixed; left:12px; top:12px; width:260px; display:flex; flex-direction:column; gap:10px; z-index:10; }
+  .row { display:flex; gap:10px; }
+  .box { background:var(--panel); border:1px solid var(--edge); border-radius:8px; padding:8px; }
+  label { display:block; font-size:12px; color:var(--mut); margin-bottom:4px; }
+  select,input[type="number"] { width:100%; background:#0f141a; color:var(--text); border:1px solid #2a3240; border-radius:6px; padding:6px; }
+  button { width:100%; background:#1f2630; color:var(--text); border:1px solid #2a3240; border-radius:8px; padding:10px; cursor:pointer; }
+  button:disabled { opacity:.55; cursor:not-allowed; }
+  .slider { width:100%; }
+  #status { min-height:40px; }
+  #hud { position:fixed; right:12px; top:12px; background:rgba(0,0,0,.35); padding:6px 10px; border-radius:6px; color:#e6e8ea; font-size:12px; }
+  .row3 { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; }
+</style>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+
+<script defer src="https://cdn.jsdelivr.net/npm/gif.js.optimized@0.2.0/dist/gif.min.js"></script>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<div id="ui">
+  <div class="row">
+    <div class="box" style="flex:1">
+      <label>backend</label>
+      <select id="backend">
+        <option value="smirnoff" selected>smirnoff</option>
+        <option value="reaxff">reaxff</option>
+        <option value="psi4">psi4</option>
+      </select>
+    </div>
+    <div class="box" style="width:92px">
+      <label>steps</label>
+      <input id="steps" type="number" value="20" min="1" max="2000"/>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="box" style="flex:1">
+      <label>timestep (ps)</label>
+      <input id="dt" type="number" step="0.00001" value="0.002"/>
+    </div>
+    <div class="box" style="flex:1">
+      <label>speed (×)</label>
+      <input id="speed" type="number" step="0.1" value="1.0"/>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="box" style="flex:1">
+      <label>scale (world/Å)</label>
+      <select id="scale">
+        <option value="0.06">0.06</option>
+        <option value="0.08">0.08</option>
+        <option value="0.10" selected>0.10</option>
+        <option value="0.12">0.12</option>
+      </select>
+    </div>
+    <div class="box" style="flex:1">
+      <label>example</label>
+      <select id="example"><option>(loading…)</option></select>
+    </div>
+  </div>
+
+  <div class="row">
+    <button id="run">run simulate</button>
+    <button id="play" disabled>play</button>
+  </div>
+
+  <input id="frame" type="range" min="1" max="1" value="1" class="slider"/>
+
+  <div class="row3">
+    <button id="dlpng" disabled>download png</button>
+    <button id="dlsvg" disabled>download svg</button>
+    <button id="dlgif" disabled>download gif</button>
+  </div>
+
+  <div id="status" class="box">ready.</div>
+  <div class="box" style="font-size:12px; color:#a8b2bd">
+    tips:<br/>
+    • reaxff needs tiny dt (≤ 0.001 ps). try 0.00025 ps.<br/>
+    • psi4 needs small dt (≤ 0.0005–0.001 ps). 0.0005 is safe.<br/>
+    • change “scale” if atoms look too big/small.
+  </div>
+</div>
+<div id="hud">frame: 1/1</div>
+
+<script type="module">
+  import * as THREE from "three";
+  import { OrbitControls } from "https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js";
+
+  const ui = {
+    backend: document.getElementById('backend'),
+    steps: document.getElementById('steps'),
+    dt: document.getElementById('dt'),
+    speed: document.getElementById('speed'),
+    scale: document.getElementById('scale'),
+    example: document.getElementById('example'),
+    run: document.getElementById('run'),
+    play: document.getElementById('play'),
+    frame: document.getElementById('frame'),
+    dlpng: document.getElementById('dlpng'),
+    dlsvg: document.getElementById('dlsvg'),
+    dlgif: document.getElementById('dlgif'),
+    status: document.getElementById('status'),
+    hud: document.getElementById('hud'),
+    canvas: document.getElementById('canvas'),
+  };
+
+  let renderer, scene, camera, controls;
+  let spheres = [];
+  let frames = [];
+  let frameIndex = 0;
+  let radiiA = [];
+  let elems = [];
+  let playing = false;
+  window._identity = null;
+
+  init();
+  loadExamples().then(()=>resize());
+  window.addEventListener('resize', resize);
+
+  ui.run.onclick = runSim;
+  ui.play.onclick = () => { playing = !playing; };
+  ui.frame.oninput = () => { setFrame(parseInt(ui.frame.value,10)-1); };
+  ui.dlpng.onclick = () => downloadPNG();
+  ui.dlsvg.onclick = () => downloadSVG();
+  ui.dlgif.onclick = () => downloadGIF();
+
+  function init(){
+    renderer = new THREE.WebGLRenderer({
+      canvas: ui.canvas,
+      antialias: true,
+      alpha: true,
+      preserveDrawingBuffer: true,
+      logarithmicDepthBuffer: true
+    });
+    renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+
+    scene = new THREE.Scene();
+    scene.background = null;
+
+    camera = new THREE.PerspectiveCamera(45, 2, 0.01, 5000);
+    camera.position.set(6,6,10);
+
+    controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+    controls.minDistance = 0.1;
+    controls.maxDistance = 200;
+
+    const amb = new THREE.AmbientLight(0xffffff, 0.6);
+    const dir = new THREE.DirectionalLight(0xffffff, 0.9);
+    dir.position.set(3,5,4);
+    scene.add(amb, dir);
+
+    (function loop(){
+      requestAnimationFrame(loop);
+      controls.update();
+      renderer.render(scene, camera);
+      if (playing && frames.length > 0) {
+        frameIndex = (frameIndex + Math.max(1, Math.floor(+ui.speed.value))) % frames.length;
+        setFrame(frameIndex);
+      }
+    })();
+  }
+
+  async function loadExamples(){
+    ui.example.innerHTML = '';
+    try {
+      const r = await fetch('/demo/examples', {cache: 'no-store'});
+      const arr = await r.json();
+      for (const name of arr) {
+        const opt = document.createElement('option');
+        opt.value = name; opt.textContent = name;
+        ui.example.appendChild(opt);
+      }
+    } catch {
+      const opt = document.createElement('option');
+      opt.value = 'methane'; opt.textContent = 'methane';
+      ui.example.appendChild(opt);
+    }
+  }
+
+  function resize(){
+    const w = window.innerWidth, h = window.innerHeight;
+    renderer.setSize(w, h, false);
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+  }
+
+  function setStatus(msg){ ui.status.textContent = msg; }
+
+  function atomColor(el){
+    if (el==='H') return 0xffffff;
+    if (el==='O') return 0xff3b30;
+    if (el==='C') return 0x5ac8fa;
+    if (el==='N') return 0x34c759;
+    return 0xd1d1d6;
+  }
+
+  function clearSpheres(){
+    for(const s of spheres){ scene.remove(s); s.geometry.dispose(); s.material.dispose(); }
+    spheres = [];
+  }
+
+  function ensureSpheres(n){
+    while(spheres.length < n){
+      const geo = new THREE.SphereGeometry(1, 96, 96);
+      const mat = new THREE.MeshStandardMaterial({ roughness:0.3, metalness:0.0, dithering:true });
+      mat.polygonOffset = true; mat.polygonOffsetFactor = 1; mat.polygonOffsetUnits = 1;
+      const m = new THREE.Mesh(geo, mat);
+      spheres.push(m); scene.add(m);
+    }
+    while(spheres.length > n){
+      const m = spheres.pop();
+      scene.remove(m); m.geometry.dispose(); m.material.dispose();
+    }
+  }
+
+  function setFrame(i){
+    if(frames.length===0) return;
+    frameIndex = Math.max(0, Math.min(i, frames.length-1));
+    const pos = frames[frameIndex];
+    ensureSpheres(pos.length);
+
+    const scale = parseFloat(ui.scale.value);
+    let minx=+1e9, miny=+1e9, minz=+1e9, maxx=-1e9, maxy=-1e9, maxz=-1e9;
+    for (let k=0;k<pos.length;k++){
+      const p = pos[k];
+      const r = (radiiA[k] || 1.5) * scale;
+      const m = spheres[k];
+      m.position.set(p[0]*scale, p[1]*scale, p[2]*scale);
+      m.scale.setScalar(r);
+      m.material.color.setHex(atomColor(elems[k] || 'C'));
+      minx = Math.min(minx, m.position.x-r); maxx = Math.max(maxx, m.position.x+r);
+      miny = Math.min(miny, m.position.y-r); maxy = Math.max(maxy, m.position.y+r);
+      minz = Math.min(minz, m.position.z-r); maxz = Math.max(maxz, m.position.z+r);
+    }
+
+    const dx=maxx-minx, dy=maxy-miny, dz=maxz-minz;
+    const radius = Math.max(dx, dy, dz) * 0.55 + 0.4;
+    const center = new THREE.Vector3((minx+maxx)/2, (miny+maxy)/2, (minz+maxz)/2);
+    controls.target.copy(center);
+
+    const z = radius / Math.tan((camera.fov*Math.PI/180)/2);
+    const dist = Math.max(1.2*z, 2.5);
+    camera.position.copy(center.clone().add(new THREE.Vector3(0, 0, dist)));
+    camera.near = Math.max(0.01, radius*0.02);
+    camera.far  = Math.max(200, radius*10);
+    camera.updateProjectionMatrix();
+
+    ui.frame.value = String(frameIndex+1);
+    const name = (window._identity && (window._identity.common_name || window._identity.iupac_name || window._identity.formula)) || "";
+    ui.hud.textContent = (name ? (name + " • ") : "") + `frame: ${frameIndex+1}/${frames.length}`;
+  }
+
+  async function runSim(){
+    clearSpheres();
+    setStatus('running…');
+    ui.play.disabled = true; ui.dlpng.disabled = true; ui.dlsvg.disabled = true; ui.dlgif.disabled = true;
+
+    const ex = ui.example.value || 'methane';
+    const exData = await fetch(`/demo/examples/${ex}`, {cache:'no-store'}).then(r=>r.json());
+
+    const body = {
+      backend: ui.backend.value,
+      timestep_ps: parseFloat(ui.dt.value),
+      n_steps: parseInt(ui.steps.value, 10),
+      atoms: exData.atoms,
+      report_stride: 1,
+      include_identity: true,
+      allow_online_names: false
+    };
+
+    const resp = await fetch('/simulate', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body)});
+    const data = await resp.json();
+    if (data.status !== 'success') { setStatus(data.message || 'error'); return; }
+
+    frames = (data.trajectory || []).map(f => f.positions);
+    elems = (data.atoms || []).map(a => a.element);
+    radiiA = data.atom_radii_A || new Array(elems.length).fill(1.5);
+    window._identity = data.identity || null;
+
+    ui.frame.min = '1'; ui.frame.max = String(Math.max(1, frames.length)); ui.frame.value = '1';
+    setFrame(0);
+
+    setStatus('ready.');
+    ui.play.disabled = frames.length < 2;
+    ui.dlpng.disabled = false; ui.dlsvg.disabled = false; ui.dlgif.disabled = false;
+  }
+
+  function withTransparentExport(fn){
+    const prev = scene.background;
+    scene.background = null;
+    fn();
+    scene.background = prev;
+  }
+
+  function downloadPNG(){
+    withTransparentExport(()=>{
+      const url = renderer.domElement.toDataURL('image/png');
+      const a = document.createElement('a'); a.href = url; a.download = 'molecule.png'; a.click();
+    });
+  }
+
+  function downloadSVG(){
+    withTransparentExport(()=>{
+      const w = renderer.domElement.width, h = renderer.domElement.height;
+      const pngData = renderer.domElement.toDataURL('image/png');
+      const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}"><image href="${pngData}" width="${w}" height="${h}"/></svg>`;
+      const blob = new Blob([svg], {type:'image/svg+xml'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href = url; a.download = 'molecule.svg'; a.click();
+      URL.revokeObjectURL(url);
+    });
+  }
+
+  async function loadGIF(){ if (window.GIF) return window.GIF; await new Promise((res,rej)=>{ const s=document.createElement('script'); s.src='https://cdn.jsdelivr.net/npm/gif.js.optimized@0.2.0/dist/gif.min.js'; s.onload=res; s.onerror=rej; document.head.appendChild(s); }); return window.GIF; }
+
+  async function downloadGIF(){
+    const GIF = await loadGIF();
+    const gif = new GIF({workers:2, quality:10, workerScript:'https://cdn.jsdelivr.net/npm/gif.js.optimized@0.2.0/dist/gif.worker.js', transparent:0x000000});
+    const n = 90;
+    const target = controls.target.clone();
+    const dist = camera.position.distanceTo(target);
+    const elev = Math.PI/4;
+
+    for (let i=0;i<n;i++){
+      const t = i / n;
+      const az = t * Math.PI * 2;
+      const x = target.x + dist * Math.cos(az) * Math.cos(elev);
+      const y = target.y + dist * Math.sin(elev);
+      const z = target.z + dist * Math.sin(az) * Math.cos(elev);
+      camera.position.set(x,y,z);
+      camera.lookAt(target);
+      renderer.render(scene, camera);
+      gif.addFrame(renderer.domElement, {copy:true, delay:50});
+    }
+    gif.on('finished', (blob) => {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob); a.download = 'molecule.gif'; a.click();
+    });
+    gif.render();
+  }
+</script>
+</body>
+</html>
