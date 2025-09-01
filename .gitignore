@@ -35,6 +35,7 @@ logs/
 tmp/
 scratch/
 outputs/
+out/
 runs/
 **/*.log
 *.log

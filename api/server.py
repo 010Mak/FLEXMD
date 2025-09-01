@@ -1,3 +1,4 @@
+# api/server.py
 from __future__ import annotations
 
 import math
@@ -9,7 +10,8 @@ from flask import Flask, jsonify, request, Response, send_from_directory
 
 from utilities.config import (
     RUN_HOST, RUN_PORT, DEBUG, DEFAULT_BACKEND, DEFAULT_TIMESTEP_PS, FORCEFIELD_DIR,
-    BACKENDS, MAX_ATOMS, MAX_STEPS, MAX_REPORT_FRAMES, MAX_REQUEST_BYTES
+    BACKENDS, MAX_ATOMS, MAX_STEPS, MAX_REPORT_FRAMES, MAX_REQUEST_BYTES,
+    DISCORD_WEBHOOK_URL, WEBHOOK_ON_STARTUP, WEBHOOK_ON_SIMULATE, SERVER_NAME, SERVER_LOCATION
 )
 from utilities.radii import vdw_radius
 from utilities.identify import identify_from_atoms
@@ -19,6 +21,10 @@ from simulation.integrators import VerletIntegrator
 from simulation.thermostats import LangevinThermostat
 from simulation.engine_core import EngineCore
 
+from utilities import status as status_util
+from utilities import discord_webhook as dwh
+
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("server")
 
@@ -27,9 +33,14 @@ DEMO_DIR = ROOT / "demo"
 
 app = Flask(__name__)
 
+
+# -------------------------
+# Helpers
+# -------------------------
 def _error(msg: str, code: int = 500):
     log.error(msg)
     return jsonify(status="error", message=msg), code
+
 
 def _as_bool(v: Any, default: bool = False) -> bool:
     if v is None:
@@ -38,12 +49,14 @@ def _as_bool(v: Any, default: bool = False) -> bool:
         return v
     return str(v).lower() in ("1", "true", "yes", "on")
 
+
 def _no_store(resp: Response) -> Response:
     resp.cache_control.no_store = True
     resp.cache_control.max_age = 0
     resp.headers["Pragma"] = "no-cache"
     resp.headers["Expires"] = "0"
     return resp
+
 
 def _validate_atoms(items: Any) -> Tuple[bool, str]:
     if not isinstance(items, list) or not items:
@@ -65,6 +78,7 @@ def _validate_atoms(items: Any) -> Tuple[bool, str]:
             return False, f"atom #{i} position must be finite"
     return True, ""
 
+
 @app.before_request
 def _limit_size():
     if request.path in ("/simulate", "/identify"):
@@ -72,9 +86,63 @@ def _limit_size():
         if cl is not None and cl > MAX_REQUEST_BYTES:
             return _error("request too large", 413)
 
+
+# -------------------------
+# Startup webhook (Flask 3-compatible)
+# -------------------------
+_STARTUP_WEBHOOK_SENT = False
+
+def _send_startup_webhook():
+    try:
+        if DISCORD_WEBHOOK_URL and WEBHOOK_ON_STARTUP:
+            info = status_util.gather_server_status()
+            embed = dwh.server_embed(info)
+            dwh.post(DISCORD_WEBHOOK_URL, embeds=[embed], wait=True)
+            log.info("startup webhook posted")
+    except Exception as e:
+        log.warning("startup webhook failed: %s", e)
+
+# Prefer before_serving (available in Flask 2/3); fallback to first request
+if hasattr(app, "before_serving"):
+    @app.before_serving
+    def _startup_webhook_before_serving():
+        global _STARTUP_WEBHOOK_SENT
+        if not _STARTUP_WEBHOOK_SENT:
+            _send_startup_webhook()
+            _STARTUP_WEBHOOK_SENT = True
+else:
+    @app.before_request
+    def _startup_webhook_fallback():
+        global _STARTUP_WEBHOOK_SENT
+        if not _STARTUP_WEBHOOK_SENT:
+            _send_startup_webhook()
+            _STARTUP_WEBHOOK_SENT = True
+
+
+# -------------------------
+# Endpoints
+# -------------------------
 @app.get("/health")
 def health() -> Response:
     return jsonify(status="ok"), 200
+
+
+@app.get("/status")
+def status() -> Response:
+    try:
+        info = status_util.gather_server_status()
+        return jsonify({
+            "status": "ok",
+            "server": info["server"],
+            "config": info["config"],
+            "plugins": info["plugins"],
+            "smirnoff": info["smirnoff"],
+            "reaxff": info["reaxff"],
+        }), 200
+    except Exception as e:
+        log.exception("status failed")
+        return _error(f"status failed: {e}", 500)
+
 
 @app.get("/demo")
 def demo_index() -> Response:
@@ -84,10 +152,12 @@ def demo_index() -> Response:
     resp = send_from_directory(str(DEMO_DIR), "index.html")
     return _no_store(resp)
 
+
 @app.get("/demo/examples")
 def demo_examples() -> Response:
     resp = jsonify(["methane", "water", "hydroxide"])
     return _no_store(resp)
+
 
 @app.get("/demo/examples/<name>")
 def demo_example(name: str) -> Response:
@@ -114,10 +184,12 @@ def demo_example(name: str) -> Response:
     resp = jsonify({"atoms": atoms})
     return _no_store(resp)
 
+
 @app.get("/demo/<path:filename>")
 def demo_files(filename: str) -> Response:
     resp = send_from_directory(str(DEMO_DIR), filename)
     return _no_store(resp)
+
 
 @app.post("/identify")
 def identify() -> Response:
@@ -132,6 +204,7 @@ def identify() -> Response:
     allow_online = _as_bool(payload.get("allow_online_names"), False)
     ident = identify_from_atoms(atoms_json, allow_online=allow_online)
     return jsonify(status="success", identity=ident), 200
+
 
 @app.post("/simulate")
 def simulate() -> Response:
@@ -168,7 +241,6 @@ def simulate() -> Response:
         stride_adjusted = True
 
     system = System.from_json(atoms_json)
-
     integrator = VerletIntegrator(timestep=dt_ps)
 
     thermostat = None
@@ -178,6 +250,7 @@ def simulate() -> Response:
         thermostat = LangevinThermostat(target_temp=default_temp, friction=friction)
 
     plugin_args = dict(payload.get("plugin_args", {}))
+    include_thermo = _as_bool(payload.get("include_thermo"), False)
 
     try:
         engine = EngineCore.from_config(
@@ -193,28 +266,37 @@ def simulate() -> Response:
         return _error(f"engine setup failed: {e}", 400)
 
     try:
-        results = engine.run(n_steps)
+        results = engine.run(n_steps, include_thermo=include_thermo)
     except Exception:
         log.exception("simulation failed")
         return _error("simulation failed", 500)
 
     frames = []
     for r in results[::report_stride]:
-        frames.append(
-            {
-                "step": r.step,
-                "time_ps": r.time,
-                "positions": r.positions.tolist(),
-                "velocities": r.velocities.tolist(),
-                "energy": r.energy,
-                "forces": r.forces.tolist(),
-            }
-        )
+        frame: Dict[str, Any] = {
+            "step": r.step,
+            "time_ps": r.time,
+            "positions": r.positions.tolist(),
+            "velocities": r.velocities.tolist(),
+            "energy": r.energy,
+            "forces": r.forces.tolist(),
+        }
+        if include_thermo:
+            ke = getattr(r, "kinetic", None)
+            tK = getattr(r, "temperature", None)
+            te = getattr(r, "total_energy", None)
+            if ke is not None:
+                frame["kinetic_energy_kcal_per_mol"] = float(ke)
+            if tK is not None:
+                frame["temperature_K"] = float(tK)
+            if te is not None:
+                frame["total_energy_kcal_per_mol"] = float(te)
+        frames.append(frame)
 
     atoms_out = [{"element": a["element"]} for a in atoms_json]
     radii = [float(vdw_radius(a["element"])) for a in atoms_json]
 
-    meta = {
+    meta: Dict[str, Any] = {
         "backend_requested": backend,
         "selected_backend": getattr(engine.plugin, "NAME", "unknown"),
         "n_atoms": len(atoms_json),
@@ -224,6 +306,12 @@ def simulate() -> Response:
         "timestep_ps": dt_ps,
         "units": {"length": "angstrom", "time": "ps", "energy": "kcal/mol", "force": "kcal/mol/angstrom"},
     }
+    if include_thermo:
+        meta["units"].update({
+            "kinetic_energy": "kcal/mol",
+            "total_energy": "kcal/mol",
+            "temperature": "K",
+        })
 
     include_identity = _as_bool(payload.get("include_identity"), True)
     allow_online_names = _as_bool(payload.get("allow_online_names"), False)
@@ -264,7 +352,24 @@ def simulate() -> Response:
     if identity:
         resp["identity"] = identity
 
+    # Optional per-simulation webhook
+    try:
+        if DISCORD_WEBHOOK_URL and WEBHOOK_ON_SIMULATE:
+            meta_for_embed = {
+                "selected_backend": getattr(engine.plugin, "NAME", backend),
+                "n_atoms": len(atoms_json),
+                "n_steps": n_steps,
+                "timestep_ps": dt_ps,
+                "report_stride": report_stride,
+                "report_stride_was_adjusted": stride_adjusted,
+            }
+            embed = dwh.simulate_embed(meta_for_embed)
+            dwh.post(DISCORD_WEBHOOK_URL, embeds=[embed])
+    except Exception as e:
+        log.warning("simulate webhook failed: %s", e)
+
     return jsonify(resp), 200
+
 
 if __name__ == "__main__":
     FORCEFIELD_DIR.mkdir(parents=True, exist_ok=True)

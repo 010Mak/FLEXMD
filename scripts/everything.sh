@@ -1,15 +1,13 @@
-#!/usr/bin/env bash
-
 set -Eeuo pipefail
 
 BASE="${BASE:-http://127.0.0.1:5000}"
-BACKEND="${BACKEND:-auto}"          # smirnoff | reaxff | psi4 | auto
-EX="${EX:-methane}"                 # methane | water | hydroxide
+BACKEND="${BACKEND:-auto}"         
+EX="${EX:-methane}"             
 N="${N:-5}"
-DT_PS="${DT_PS:-0.0005}"            # 0.0005 ps safe for psi4 + others
+DT_PS="${DT_PS:-0.0005}"          
 TEMP_K="${TEMP_K:-298.0}"
 FRICTION="${FRICTION:-1.0}"
-ALLOW_ONLINE="${ALLOW_ONLINE:-false}" # true|false
+ALLOW_ONLINE="${ALLOW_ONLINE:-false}" 
 
 pp(){ if command -v jq >/dev/null 2>&1; then jq -r "$1"; else cat; fi; }
 

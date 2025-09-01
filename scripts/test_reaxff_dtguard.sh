@@ -29,10 +29,7 @@ resp="$(curl -sS -X POST "${BASE}/simulate" \
   "n_steps": 1,
   "atoms": [
     {"element": "C", "position": [ 0.000,  0.000,  0.000]},
-    {"element": "H", "position": [ 0.629,  0.629,  0.629]},
-    {"element": "H", "position": [ 0.629, -0.629, -0.629]},
-    {"element": "H", "position": [-0.629,  0.629, -0.629]},
-    {"element": "H", "position": [-0.629, -0.629,  0.629]}
+    {"element": "O", "position": [ 0.629,  0.629,  0.629]}
   ]
 }
 JSON
@@ -51,10 +48,7 @@ curl -sS -X POST "${BASE}/simulate" \
   "plugin_args": { "qeq_fix": "shielded", "auto_resize_box": true },
   "atoms": [
     {"element": "C", "position": [ 0.000,  0.000,  0.000]},
-    {"element": "H", "position": [ 0.629,  0.629,  0.629]},
-    {"element": "H", "position": [ 0.629, -0.629, -0.629]},
-    {"element": "H", "position": [-0.629,  0.629, -0.629]},
-    {"element": "H", "position": [-0.629, -0.629,  0.629]}
+    {"element": "O", "position": [ 0.629,  0.629,  0.629]}
   ]
 }
 JSON

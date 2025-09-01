@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple, Iterable, Union
@@ -197,8 +196,6 @@ def identify_from_atoms(
 
     return ident
 
-
-
 def _identity_from_mol(
     *,
     mol: Optional[Chem.Mol],
@@ -333,8 +330,6 @@ def _identity_from_mol(
             pass
 
     return identity
-
-
 
 def _norm_symbol(sym: str) -> str:
     s = (sym or "").strip()

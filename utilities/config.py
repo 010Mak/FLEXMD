@@ -1,5 +1,27 @@
 import os
 from pathlib import Path
+import socket, os
+from utilities.discord_webhook import _valid_discord_webhook
+
+def _env_bool(name: str, default: str = "0") -> bool:
+    return str(os.getenv(name, default)).lower() in ("1", "true", "yes", "on")
+
+SERVER_NAME = os.getenv("MMDFLED_SERVER_NAME", socket.gethostname())
+SERVER_LOCATION = os.getenv("MMDFLED_SERVER_LOCATION", "New_york")  
+
+_DEFAULT_DISCORD_WEBHOOK_URL = ""
+
+_env_url = (os.getenv("MMDFLED_DISCORD_WEBHOOK") or "").strip()
+if _valid_discord_webhook(_env_url):
+    DISCORD_WEBHOOK_URL = _env_url
+else:
+    DISCORD_WEBHOOK_URL = _DEFAULT_DISCORD_WEBHOOK_URL
+
+def _env_bool(name: str, default: str = "0") -> bool:
+    return str(os.getenv(name, default)).lower() in ("1","true","yes","on")
+
+WEBHOOK_ON_STARTUP  = _env_bool("MMDFLED_WEBHOOK_ON_STARTUP", "1" if DISCORD_WEBHOOK_URL else "0")
+WEBHOOK_ON_SIMULATE = _env_bool("MMDFLED_WEBHOOK_ON_SIMULATE", "0")
 
 RUN_HOST = os.getenv("MMDFLED_RUN_HOST", "0.0.0.0")
 RUN_PORT = int(os.getenv("MMDFLED_RUN_PORT", "5000"))

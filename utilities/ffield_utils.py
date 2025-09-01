@@ -1,5 +1,5 @@
 from __future__ import annotations
-import re
+import os, re, glob
 from pathlib import Path
 from typing import List, Set, Tuple, Optional, Union
 from functools import lru_cache
@@ -49,3 +49,40 @@ def pick_ffield(
 
 def clear_cache() -> None:
     _find_ffield_files.cache_clear()
+
+_ELEMENT_RE = re.compile(r"[A-Z][a-z]?")
+_KNOWN = {
+    "H","He","Li","Be","B","C","N","O","F","Ne","Na","Mg","Al","Si","P","S","Cl","Ar","K","Ca","Sc",
+    "Ti","V","Cr","Mn","Fe","Co","Ni","Cu","Zn","Ga","Ge","As","Se","Br","Kr","Rb","Sr","Y","Zr",
+    "Nb","Mo","Tc","Ru","Rh","Pd","Ag","Cd","In","Sn","Sb","Te","I","Xe","Cs","Ba","La","Ce","Pr",
+    "Nd","Pm","Sm","Eu","Gd","Tb","Dy","Ho","Er","Tm","Yb","Lu","Hf","Ta","W","Re","Os","Ir","Pt",
+    "Au","Hg","Tl","Pb","Bi","Po","At","Rn","Fr","Ra","Ac","Th","Pa","U","Np","Pu","Am","Cm","Bk",
+    "Cf","Es","Fm","Md","No","Lr"
+}
+
+def extract_elements_from_ffield_path(path: str) -> list[str]:
+    """Heuristic: pull element symbols from the filename."""
+    name = os.path.basename(path)
+    cand = _ELEMENT_RE.findall(name)
+    elems = [t for t in cand if t in _KNOWN]
+    out, seen = [], set()
+    for e in elems:
+        if e not in seen:
+            out.append(e); seen.add(e)
+    return out
+
+def scan_potentials_dir(pot_dir: str) -> dict:
+    """Return all ffield files + union of elements for status/webhook."""
+    patterns = [os.path.join(pot_dir, "ffield*"), os.path.join(pot_dir, "*.ff")]
+    files = sorted({p for pat in patterns for p in glob.glob(pat) if os.path.isfile(p)})
+    entries = []
+    union = set()
+    for f in files:
+        elems = extract_elements_from_ffield_path(f)
+        union.update(elems)
+        entries.append({"file": os.path.basename(f), "elements": elems})
+    return {
+        "directory": pot_dir,
+        "potentials": entries,
+        "supported_elements": sorted(union)
+    }

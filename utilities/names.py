@@ -19,7 +19,6 @@ def _make_session(user_agent: str = "mmd-sim/0.1 (naming)") -> requests.Session:
 
 _session = _make_session()
 
-
 _WS = re.compile(r"\s+")
 def _clean(s: str) -> str:
     s = s.strip()
