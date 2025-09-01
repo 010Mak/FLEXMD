@@ -1,4 +1,3 @@
-# api/server.py
 from __future__ import annotations
 
 import math
@@ -34,9 +33,6 @@ DEMO_DIR = ROOT / "demo"
 app = Flask(__name__)
 
 
-# -------------------------
-# Helpers
-# -------------------------
 def _error(msg: str, code: int = 500):
     log.error(msg)
     return jsonify(status="error", message=msg), code
@@ -87,9 +83,6 @@ def _limit_size():
             return _error("request too large", 413)
 
 
-# -------------------------
-# Startup webhook (Flask 3-compatible)
-# -------------------------
 _STARTUP_WEBHOOK_SENT = False
 
 def _send_startup_webhook():
@@ -102,7 +95,6 @@ def _send_startup_webhook():
     except Exception as e:
         log.warning("startup webhook failed: %s", e)
 
-# Prefer before_serving (available in Flask 2/3); fallback to first request
 if hasattr(app, "before_serving"):
     @app.before_serving
     def _startup_webhook_before_serving():
@@ -119,9 +111,6 @@ else:
             _STARTUP_WEBHOOK_SENT = True
 
 
-# -------------------------
-# Endpoints
-# -------------------------
 @app.get("/health")
 def health() -> Response:
     return jsonify(status="ok"), 200
@@ -352,7 +341,6 @@ def simulate() -> Response:
     if identity:
         resp["identity"] = identity
 
-    # Optional per-simulation webhook
     try:
         if DISCORD_WEBHOOK_URL and WEBHOOK_ON_SIMULATE:
             meta_for_embed = {
