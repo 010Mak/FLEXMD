@@ -19,11 +19,6 @@ def kinetic_and_temperature(
     remove_com: bool = True,
     dof_offset: int = 0
 ) -> tuple[float, float, int]:
-    """
-    Returns (K_kcal/mol, T_K, dof) given velocities in Å/ps and masses in amu.
-    If remove_com=True, subtracts center-of-mass velocity (removes 3 DOF).
-    dof_offset can account for constraints, etc.
-    """
     v = np.asarray(velocities_A_per_ps, dtype=float)
     m = np.asarray(masses_amu, dtype=float)
     assert v.ndim == 2 and v.shape[1] == 3, "velocities must be (N,3)"
@@ -53,7 +48,6 @@ def attach_thermo(
     remove_com: bool = True,
     dof_offset: int = 0
 ) -> object:
-    """Compute KE/T and attach kinetic/temperature/total_energy to a result object."""
     K_kcalmol, T_K, _ = kinetic_and_temperature(
         velocities_A_per_ps, masses_amu, remove_com=remove_com, dof_offset=dof_offset
     )
