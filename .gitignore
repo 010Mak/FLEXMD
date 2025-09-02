@@ -53,7 +53,7 @@ dump.*
 *.dcd
 *.xtc
 *.out
-.dat
+*.dat
 
 *.lammps
 
