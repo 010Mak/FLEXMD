@@ -1,4 +1,3 @@
-# utilities/discord_webhook.py
 from __future__ import annotations
 import json, urllib.request, urllib.error, urllib.parse
 from typing import Any, Dict, List, Optional
@@ -23,7 +22,7 @@ def post(
     *,
     content: Optional[str] = None,
     embeds: Optional[List[Dict[str, Any]]] = None,
-    wait: bool = True,                         # ask Discord to return 200 + JSON
+    wait: bool = True,
     username: Optional[str] = None
 ) -> None:
     if not _valid_discord_webhook(url):
@@ -47,7 +46,6 @@ def post(
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             code = resp.getcode()
-            # Optional: print first 120 bytes of body when wait=true
             body = resp.read(120).decode("utf-8", "ignore")
             print(f"[discord] posted ({code}) {body[:120]}")
     except urllib.error.HTTPError as e:
