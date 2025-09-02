@@ -3,7 +3,6 @@ import json, urllib.request, urllib.error, urllib.parse
 from typing import Any, Dict, List, Optional
 
 def _valid_discord_webhook(url: str) -> bool:
-    """Expect https://discord.com/api/webhooks/<id>/<token>"""
     try:
         p = urllib.parse.urlparse(url or "")
         parts = [x for x in p.path.split("/") if x]

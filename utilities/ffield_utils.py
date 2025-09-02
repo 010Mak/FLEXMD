@@ -61,7 +61,6 @@ _KNOWN = {
 }
 
 def extract_elements_from_ffield_path(path: str) -> list[str]:
-    """Heuristic: pull element symbols from the filename."""
     name = os.path.basename(path)
     cand = _ELEMENT_RE.findall(name)
     elems = [t for t in cand if t in _KNOWN]
@@ -72,7 +71,6 @@ def extract_elements_from_ffield_path(path: str) -> list[str]:
     return out
 
 def scan_potentials_dir(pot_dir: str) -> dict:
-    """Return all ffield files + union of elements for status/webhook."""
     patterns = [os.path.join(pot_dir, "ffield*"), os.path.join(pot_dir, "*.ff")]
     files = sorted({p for pat in patterns for p in glob.glob(pat) if os.path.isfile(p)})
     entries = []
