@@ -1,10 +1,10 @@
-
 from __future__ import annotations
-import logging, tempfile, shutil, importlib.util
+import logging, tempfile, shutil, importlib.util, math
 from pathlib import Path
 from typing import List, Tuple
 import numpy as np
 from ctypes import c_double
+
 from utilities.config import FORCEFIELD_DIR
 from utilities.ffield_utils import pick_ffield
 from utilities.radii import get_atomic_mass
@@ -13,6 +13,8 @@ from simulation.system import System
 
 _FS_PER_PS = 1000.0
 _MAX_SAFE_DT_PS = 0.001
+_ENERGY_GUARD = 5.0e3
+
 _log = logging.getLogger(__name__)
 
 class ReaxFFPlugin(ForceCalculator):
@@ -44,6 +46,7 @@ class ReaxFFPlugin(ForceCalculator):
         auto_resize_box: bool = True,
         use_nvt: bool = False,
         nvt_tdamp_ps: float = 0.1,
+        prefer_pair: str = "auto",
     ):
         self.ff_path = ff_path
         self.temperature = float(temperature)
@@ -59,6 +62,7 @@ class ReaxFFPlugin(ForceCalculator):
         self.auto_resize_box = bool(auto_resize_box)
         self.use_nvt = bool(use_nvt)
         self.nvt_tdamp_ps = float(nvt_tdamp_ps)
+        self.prefer_pair = prefer_pair.lower().strip()
 
         self._lmp = None
         self._tmpdir: Path | None = None
@@ -66,6 +70,10 @@ class ReaxFFPlugin(ForceCalculator):
         self._data_file: Path | None = None
         self._box_bounds: Tuple[float, float, float, float, float, float] | None = None
         self._integrator_fix: str | None = None
+        self._pair_style: str | None = None
+        self._last_good_pos: np.ndarray | None = None
+        self._have_fq: bool = False
+
 
     def _compute_bounds(self, positions: np.ndarray) -> Tuple[float, float, float, float, float, float]:
         mins, maxs = positions.min(axis=0), positions.max(axis=0)
@@ -98,54 +106,6 @@ class ReaxFFPlugin(ForceCalculator):
                 fh.write(f"{i} {t} {q:.6f} {x:.8f} {y:.8f} {z:.8f}\n")
         return dat
 
-    def _choose_qeq_fix(self, lmp) -> str:
-        if self.qeq_fix in ("shielded", "reaxff", "acks2"):
-            want = [f"qeq/{self.qeq_fix}"]
-        else:
-            want = ["qeq/shielded", "qeq/reaxff", "acks2/reaxff"]
-        for fx in want:
-            if lmp.has_style("fix", fx):
-                return fx
-        raise RuntimeError("no suitable qeq fix available (need qeq/shielded or qeq/reaxff or acks2/reaxff)")
-
-    def _configure(self, lmp, ff_file: str, order: List[str]) -> None:
-        symbols = " ".join(order)
-        if lmp.has_style("pair", "reaxff"):
-            pair_style_cmd = "pair_style reaxff NULL"
-        elif lmp.has_style("pair", "reax/c"):
-            pair_style_cmd = "pair_style reax/c"
-        else:
-            raise RuntimeError("reaxff-compatible pair style not found (need reaxff or reax/c)")
-
-        qeq_style = self._choose_qeq_fix(lmp)
-
-        cmds = [
-            "units real",
-            "atom_style charge",
-            "atom_modify map array",
-            "boundary f f f",
-            f"read_data {self._data_file}",
-            "neighbor 2.0 bin",
-            "neigh_modify every 1 delay 0 check yes one 10000 page 100000",
-            pair_style_cmd,
-            f"pair_coeff * * {ff_file} {symbols}",
-        ]
-        if qeq_style == "qeq/shielded":
-            cmds.append(f"fix fq all qeq/shielded {self.qeq_every} {self.qeq_cutoff} {self.qeq_tol} {self.qeq_maxiter} reaxff")
-        elif qeq_style == "qeq/reaxff":
-            cmds.append(f"fix fq all qeq/reaxff {self.qeq_every} {self.qeq_cutlo} {self.qeq_cuthi} {self.qeq_tol} reaxff maxiter {self.qeq_maxiter}")
-        else:
-            cmds.append(f"fix fq all acks2/reaxff {self.qeq_every} {self.qeq_cutoff} {self.qeq_tol} {self.qeq_maxiter} reaxff")
-
-        cmds += [
-            "thermo 0",
-            "compute cpe all pe",
-            f"timestep {self.timestep_ps * _FS_PER_PS}",
-            "run 0 post no",
-        ]
-        lmp.commands_list(cmds)
-        _log.info("reaxff dt_ps=%.6f (fs=%g) temp=%.1f", self.timestep_ps, self.timestep_ps * _FS_PER_PS, self.temperature)
-
     def _ensure_box(self, positions: np.ndarray) -> None:
         if self._box_bounds is None:
             return
@@ -175,6 +135,110 @@ class ReaxFFPlugin(ForceCalculator):
             lmp.command("fix mmd all nve")
             self._integrator_fix = "nve"
 
+
+    def _select_pair_style(self, lmp) -> str:
+        pref = self.prefer_pair
+        try:
+            has_reaxff = bool(lmp.has_style("pair", "reaxff"))
+        except Exception:
+            has_reaxff = True
+        try:
+            has_reaxc = bool(lmp.has_style("pair", "reax/c"))
+        except Exception:
+            has_reaxc = False
+
+        if pref in ("auto", "reaxff"):
+            if has_reaxff:
+                return "reaxff"
+        if pref == "reax/c":
+            if has_reaxff:
+                _log.warning("prefer_pair='reax/c' requested, but 'reaxff' is available; using 'reaxff'.")
+                return "reaxff"
+            if has_reaxc:
+                return "reax/c"
+        if has_reaxff:
+            return "reaxff"
+        if has_reaxc:
+            return "reax/c"
+        raise RuntimeError("reaxff-compatible pair style not found (need 'reaxff').")
+
+    def _choose_qeq_fix(self, lmp, pair_style: str) -> str:
+        explicit = self.qeq_fix
+        def have(style: str) -> bool:
+            try:
+                return bool(lmp.has_style("fix", style))
+            except Exception:
+                return style in ("qeq/reaxff", "acks2/reaxff", "qeq/shielded")
+        if explicit in ("reaxff", "acks2", "shielded"):
+            desired = {"reaxff": "qeq/reaxff", "acks2": "acks2/reaxff", "shielded": "qeq/shielded"}[explicit]
+            if have(desired):
+                return desired
+            raise RuntimeError(f"requested qeq fix '{desired}' not available in this LAMMPS build")
+        for fx in ("qeq/reaxff", "acks2/reaxff", "qeq/shielded"):
+            if have(fx):
+                return fx
+        raise RuntimeError("no suitable qeq fix available (need qeq/reaxff or acks2/reaxff or qeq/shielded)")
+
+    def _install_qeq_fix(self, lmp, qeq_style: str, pair_style: str) -> None:
+        if self._have_fq:
+            try:
+                lmp.command("unfix fq")
+            except Exception:
+                pass
+            self._have_fq = False
+
+        if qeq_style == "qeq/shielded":
+            lmp.command(
+                f"fix fq all qeq/shielded {self.qeq_every} {self.qeq_cutoff} "
+                f"{self.qeq_tol} {self.qeq_maxiter} {pair_style}"
+            )
+        elif qeq_style == "qeq/reaxff":
+            lmp.command(
+                f"fix fq all qeq/reaxff {self.qeq_every} {self.qeq_cutlo} {self.qeq_cuthi} "
+                f"{self.qeq_tol} {pair_style} maxiter {self.qeq_maxiter}"
+            )
+        else:
+            lmp.command(
+                f"fix fq all acks2/reaxff {self.qeq_every} {self.qeq_cutoff} "
+                f"{self.qeq_tol} {self.qeq_maxiter} {pair_style}"
+            )
+        self._have_fq = True
+
+    def _configure(self, lmp, ff_file: str, order: List[str]) -> None:
+        base_cmds = [
+            "units real",
+            "atom_style charge",
+            "atom_modify map array",
+            "boundary f f f",
+            f"read_data {self._data_file}",
+            "neighbor 2.0 bin",
+            "neigh_modify every 1 delay 0 check yes one 10000 page 100000",
+        ]
+        lmp.commands_list(base_cmds)
+
+        self._pair_style = self._select_pair_style(lmp)
+        if self._pair_style == "reax/c":
+            lmp.command("pair_style reax/c NULL")
+        else:
+            lmp.command("pair_style reaxff NULL")
+        symbols = " ".join(order)
+        lmp.command(f"pair_coeff * * {ff_file} {symbols}")
+
+        qeq_style = self._choose_qeq_fix(lmp, self._pair_style)
+        self._install_qeq_fix(lmp, qeq_style, self._pair_style)
+
+        lmp.commands_list([
+            "thermo 0",
+            "compute cpe all pe",
+            f"timestep {self.timestep_ps * _FS_PER_PS}",
+            "run 0 post yes",
+        ])
+        _log.info(
+            "reaxff ready: dt_ps=%.6f (fs=%g) temp=%.1f pair=%s qeq=%s",
+            self.timestep_ps, self.timestep_ps * _FS_PER_PS, self.temperature, self._pair_style, qeq_style
+        )
+
+
     def initialize(self, system: System) -> None:
         if self.timestep_ps > _MAX_SAFE_DT_PS:
             raise ValueError(f"reaxff timestep too large: {self.timestep_ps} ps; use <= {_MAX_SAFE_DT_PS} ps")
@@ -194,10 +258,12 @@ class ReaxFFPlugin(ForceCalculator):
         self._data_file = self._write_data(system, self._tmpdir, order)
 
         lmp = _Lmp()
-        self._configure(lmp, ff_file, order)
         self._lmp = lmp
+        self._configure(lmp, ff_file, order)
         self._ensure_integrator_fix()
-        _log.info("reaxff ready: %d atoms, ff=%s", len(system.atoms), ff_file)
+
+        self._last_good_pos = np.asarray(system.positions, dtype=np.float64, order="C").copy()
+
 
     def _gather_xyzvf(self):
         lmp = self._lmp
@@ -214,18 +280,49 @@ class ReaxFFPlugin(ForceCalculator):
     def compute_forces(self, system: System) -> np.ndarray:
         lmp = self._lmp
         assert lmp is not None
+
         pos = np.asarray(system.positions, dtype=np.float64, order="C")
         if not np.all(np.isfinite(pos)):
-            raise ValueError("non-finite positions")
+            if self._last_good_pos is not None and np.all(np.isfinite(self._last_good_pos)) and self._last_good_pos.shape == pos.shape:
+                _log.warning("non-finite positions detected; restoring last good coordinates before force eval")
+                pos = self._last_good_pos.copy()
+                system.positions[:] = pos
+            else:
+                raise ValueError("non-finite positions")
+
         self._ensure_box(pos)
+
         natoms = int(lmp.get_natoms())
         if pos.shape != (natoms, 3):
             raise ValueError(f"position shape {pos.shape} != ({natoms}, 3)")
+
         buf = (c_double * (natoms * 3))(*pos.ravel(order="C"))
         lmp.scatter_atoms("x", 1, 3, buf)
-        lmp.command("run 0 post no")
+        lmp.command("run 0 post yes")
+
+        e = float(lmp.extract_compute("cpe", 0, 0))
+        if (not math.isfinite(e)) or (abs(e) > _ENERGY_GUARD):
+            _log.warning("initial run0 energy looks bad (E=%g); trying QEq fallback", e)
+            current_pair = self._pair_style or "reaxff"
+            tried = []
+            for alt in ("qeq/reaxff", "acks2/reaxff", "qeq/shielded"):
+                if alt in tried:
+                    continue
+                tried.append(alt)
+                try:
+                    self._install_qeq_fix(lmp, alt, current_pair)
+                    lmp.command("run 0 post yes")
+                    e2 = float(lmp.extract_compute("cpe", 0, 0))
+                    _log.info("QEq retry with %s gave E=%g", alt, e2)
+                    if math.isfinite(e2) and abs(e2) <= _ENERGY_GUARD:
+                        break
+                except Exception:
+                    continue
+
         f_ct = lmp.gather_atoms("f", 1, 3)
         forces = np.ctypeslib.as_array(f_ct, shape=(natoms * 3,)).reshape((natoms, 3)).copy()
+
+        self._last_good_pos = pos.copy()
         return forces
 
     def compute_energy(self, system: System) -> float:

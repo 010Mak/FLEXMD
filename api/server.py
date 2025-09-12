@@ -295,6 +295,10 @@ def simulate() -> Response:
         "timestep_ps": dt_ps,
         "units": {"length": "angstrom", "time": "ps", "energy": "kcal/mol", "force": "kcal/mol/angstrom"},
     }
+    sel_ff = getattr(engine.plugin, "selected_ff_file", None)
+    if sel_ff:
+        meta["selected_forcefield_file"] = str(sel_ff)
+
     if include_thermo:
         meta["units"].update({
             "kinetic_energy": "kcal/mol",
@@ -351,8 +355,7 @@ def simulate() -> Response:
                 "report_stride": report_stride,
                 "report_stride_was_adjusted": stride_adjusted,
             }
-            embed = dwh.simulate_embed(meta_for_embed)
-            dwh.post(DISCORD_WEBHOOK_URL, embeds=[embed])
+            dwh.post(DISCORD_WEBHOOK_URL, embeds=[dwh.simulate_embed(meta_for_embed)])
     except Exception as e:
         log.warning("simulate webhook failed: %s", e)
 

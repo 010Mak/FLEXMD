@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 import numpy as np
 
 from simulation.system import System
@@ -8,8 +8,11 @@ from simulation.thermostats import Thermostat
 from simulation.plugin_interface import ForceCalculator
 from simulation.plugin_selector import decide as select_plugin
 from simulation.plugin_manager import PLUGINS
-from utilities.config import DEFAULT_PSI4_THRESHOLD
-from simulation.thermo import kinetic_and_temperature, attach_thermo
+from utilities.config import DEFAULT_PSI4_THRESHOLD, FORCEFIELD_DIR
+from utilities.ffield_utils import candidates_for_elements
+from simulation.thermo import attach_thermo
+
+ORGANIC_FALLBACK = {"C","H","N","O","P","S","F","Cl","Br","I","B","Si"}
 
 class StepResult:
     def __init__(
@@ -66,7 +69,6 @@ class EngineCore:
         self.plugin = plugin
         self.thermostat = thermostat
         self.time = 0.0
-        self.plugin.initialize(self.system)
 
     @classmethod
     def from_config(cls, system: System, integrator: BaseIntegrator, system_kwargs: Dict[str, Any]) -> "EngineCore":
@@ -87,11 +89,84 @@ class EngineCore:
         thermostat = system_kwargs.get("thermostat")
         return cls(system, integrator, plugin, thermostat)
 
-    def run(self, n_steps: int, *, report_stride: int = 1, include_thermo: bool = False) -> List[StepResult]:
+
+    def _elements_in_system(self) -> List[str]:
+        return sorted({a.element.capitalize() for a in self.system.atoms})
+
+    def _instantiate_plugin(self, plugin_name: str, plugin_args: Dict[str, Any]) -> ForceCalculator:
+        plugin_cls = PLUGINS[plugin_name]
+        plugin = plugin_cls(**plugin_args)
+        try:
+            plugin.set_timestep_ps(self.integrator.dt)
+        except Exception:
+            pass
+        return plugin
+
+    def _initialize_plugin(self) -> None:
+        self.plugin.initialize(self.system)
+
+    def _first_forces_energy(self) -> Tuple[np.ndarray, float]:
         forces = self.plugin.compute_forces(self.system)
         energy = self.plugin.compute_energy(self.system)
+        return forces, energy
+
+    def _try_reaxff_fallbacks(self, first_error: Exception) -> bool:
+        elems = self._elements_in_system()
+        cand_list = candidates_for_elements(elems, FORCEFIELD_DIR)
+        for ff_path, _order in cand_list:
+            try:
+                try:
+                    if hasattr(self.plugin, "close"):
+                        self.plugin.close()
+                except Exception:
+                    pass
+
+                plugin_args = getattr(self.plugin, "__dict__", {}).copy()
+                plugin_args = {k: v for k, v in plugin_args.items() if not k.startswith("_")}
+                plugin_args["ff_path"] = ff_path
+
+                new_plugin = self._instantiate_plugin("reaxff", plugin_args)
+                new_plugin.initialize(self.system)
+                self.plugin = new_plugin
+                return True
+            except Exception:
+                continue
+        return False
+
+    def _try_smirnoff_fallback(self) -> bool:
+        elems = set(self._elements_in_system())
+        if not elems.issubset(ORGANIC_FALLBACK):
+            return False
+        if "smirnoff" not in PLUGINS:
+            return False
+        try:
+            plugin_args = {"forcefield": "openff-2.1.0.offxml"}
+            new_plugin = self._instantiate_plugin("smirnoff", plugin_args)
+            new_plugin.initialize(self.system)
+            self.plugin = new_plugin
+            return True
+        except Exception:
+            return False
+
+
+    def run(self, n_steps: int, *, report_stride: int = 1, include_thermo: bool = False) -> List[StepResult]:
+        try:
+            self._initialize_plugin()
+            forces, energy = self._first_forces_energy()
+        except Exception as e:
+            name = getattr(self.plugin, "NAME", "").lower()
+            if name == "reaxff":
+                if self._try_reaxff_fallbacks(e):
+                    forces, energy = self._first_forces_energy()
+                elif self._try_smirnoff_fallback():
+                    forces, energy = self._first_forces_energy()
+                else:
+                    raise
+            else:
+                raise
 
         results: List[StepResult] = []
+
         for step in range(1, n_steps + 1):
             self.integrator.pre_force(self.system, forces)
             if self.thermostat:
@@ -118,7 +193,6 @@ class EngineCore:
                     masses_amu = getattr(self.system, "masses", None)
                 if masses_amu is None:
                     raise RuntimeError("system is missing masses (amu) needed for thermo.")
-
                 attach_thermo(
                     res,
                     velocities_A_per_ps=res.velocities,

@@ -1,86 +1,152 @@
 from __future__ import annotations
-import os, re, glob
+import os
+import re
 from pathlib import Path
-from typing import List, Set, Tuple, Optional, Union
-from functools import lru_cache
+from typing import Iterable, List, Tuple, Set, Dict, Optional
 
-from utilities.config import FORCEFIELD_DIR
+try:
+    from utilities.config import FORCEFIELD_DIR as _CFG_FF_DIR
+    _HAS_CFG = True
+except Exception:
+    _HAS_CFG = False
+    _CFG_FF_DIR = Path(".")
 
-_EL_PAT = re.compile(r"[A-Z][a-z]?")
-
-def elements_from_name(name: str) -> List[str]:
-    stem = Path(name).stem
-    stem = re.sub(r"^(ffield|reaxff?)[._-]*", "", stem, flags=re.I)
-    symbols: List[str] = []
-    for frag in re.split(r"[^A-Za-z]", stem):
-        symbols.extend(_EL_PAT.findall(frag))
-    return symbols
-
-@lru_cache(maxsize=None)
-def _find_ffield_files(dir_path: str) -> Tuple[Path, ...]:
-    p = Path(dir_path)
-    return tuple(sorted(p.glob("ffield*")))
-
-def pick_ffield(
-    elements: Set[str],
-    ff_dir: Optional[Union[str, Path]] = None,
-) -> Tuple[str, List[str]]:
-    want = {e.capitalize() for e in elements}
-    dir_path = Path(ff_dir or FORCEFIELD_DIR).resolve()
-    files = _find_ffield_files(str(dir_path))
-
-    best: Optional[Path] = None
-    best_order: List[str] = []
-    best_extra = float("inf")
-
-    for ff in files:
-        order = elements_from_name(ff.name)
-        have = set(order)
-        if not want.issubset(have):
-            continue
-        extra = len(have - want)
-        if extra < best_extra or (extra == best_extra and (best is None or ff.name < best.name)):
-            best, best_order, best_extra = ff, order, extra
-
-    if best is None:
-        raise FileNotFoundError(f"no reaxff file in '{dir_path}' covers elements {sorted(want)}")
-
-    return str(best), best_order
-
-def clear_cache() -> None:
-    _find_ffield_files.cache_clear()
-
-_ELEMENT_RE = re.compile(r"[A-Z][a-z]?")
-_KNOWN = {
-    "H","He","Li","Be","B","C","N","O","F","Ne","Na","Mg","Al","Si","P","S","Cl","Ar","K","Ca","Sc",
-    "Ti","V","Cr","Mn","Fe","Co","Ni","Cu","Zn","Ga","Ge","As","Se","Br","Kr","Rb","Sr","Y","Zr",
-    "Nb","Mo","Tc","Ru","Rh","Pd","Ag","Cd","In","Sn","Sb","Te","I","Xe","Cs","Ba","La","Ce","Pr",
-    "Nd","Pm","Sm","Eu","Gd","Tb","Dy","Ho","Er","Tm","Yb","Lu","Hf","Ta","W","Re","Os","Ir","Pt",
-    "Au","Hg","Tl","Pb","Bi","Po","At","Rn","Fr","Ra","Ac","Th","Pa","U","Np","Pu","Am","Cm","Bk",
-    "Cf","Es","Fm","Md","No","Lr"
+_PT: Set[str] = {
+    "H","He","Li","Be","B","C","N","O","F","Ne","Na","Mg","Al","Si","P","S","Cl","Ar",
+    "K","Ca","Sc","Ti","V","Cr","Mn","Fe","Co","Ni","Cu","Zn","Ga","Ge","As","Se","Br","Kr",
+    "Rb","Sr","Y","Zr","Nb","Mo","Tc","Ru","Rh","Pd","Ag","Cd","In","Sn","Sb","Te","I","Xe",
+    "Cs","Ba","La","Ce","Pr","Nd","Pm","Sm","Eu","Gd","Tb","Dy","Ho","Er","Tm","Yb","Lu",
+    "Hf","Ta","W","Re","Os","Ir","Pt","Au","Hg","Tl","Pb","Bi","Po","At","Rn",
+    "Fr","Ra","Ac","Th","Pa","U"
 }
 
-def extract_elements_from_ffield_path(path: str) -> list[str]:
-    name = os.path.basename(path)
-    cand = _ELEMENT_RE.findall(name)
-    elems = [t for t in cand if t in _KNOWN]
-    out, seen = [], set()
-    for e in elems:
-        if e not in seen:
-            out.append(e); seen.add(e)
+_ORG_OK: Set[str] = {"H","C","N","O","F","P","S","Cl","Br","I","B","Si"}
+
+_IGNORE_TOKENS = {"ff", "ffield", "reax", "reaxff"}
+
+def _default_ff_dir(ff_dir: Optional[Path]) -> Path:
+    if ff_dir is None:
+        return Path(_CFG_FF_DIR) if _HAS_CFG else Path(".")
+    return Path(ff_dir)
+
+def _iter_potential_files(ff_dir: Path) -> Iterable[Path]:
+    if not ff_dir.exists():
+        return []
+    for p in ff_dir.iterdir():
+        if not p.is_file():
+            continue
+        name = p.name.lower()
+        if name.startswith("ffield") or "reax" in name or name.endswith(".ff"):
+            yield p
+
+def _parse_elements_from_name(filename: str) -> Set[str]:
+    base = os.path.basename(filename)
+    parts = re.split(r"[^A-Za-z]+", base)
+    out: Set[str] = set()
+
+    for part in parts:
+        if not part:
+            continue
+        low = part.lower()
+        if low in _IGNORE_TOKENS or low.startswith("reax"):
+            continue
+
+        i = 0
+        L = len(part)
+        while i < L:
+            took_two = False
+            if i + 1 < L:
+                if part[i].isupper() and part[i + 1].islower():
+                    cand2 = part[i] + part[i + 1]
+                    if cand2 in _PT:
+                        out.add(cand2)
+                        i += 2
+                        took_two = True
+                        continue
+            if not took_two:
+                cand1 = part[i].upper()
+                if cand1 in _PT:
+                    out.add(cand1)
+                i += 1
     return out
 
-def scan_potentials_dir(pot_dir: str) -> dict:
-    patterns = [os.path.join(pot_dir, "ffield*"), os.path.join(pot_dir, "*.ff")]
-    files = sorted({p for pat in patterns for p in glob.glob(pat) if os.path.isfile(p)})
-    entries = []
-    union = set()
-    for f in files:
-        elems = extract_elements_from_ffield_path(f)
-        union.update(elems)
-        entries.append({"file": os.path.basename(f), "elements": elems})
-    return {
-        "directory": pot_dir,
-        "potentials": entries,
-        "supported_elements": sorted(union)
-    }
+def scan_potentials_dir(ff_dir: Optional[Path] = None) -> List[Dict[str, object]]:
+    d = _default_ff_dir(ff_dir)
+    files = list(_iter_potential_files(d))
+    rows: List[Dict[str, object]] = []
+    for p in files:
+        try:
+            els = sorted(_parse_elements_from_name(p.name), key=lambda s: (s not in _ORG_OK, s))
+            st = p.stat()
+            rows.append({
+                "path": str(p),
+                "filename": p.name,
+                "elements": els,
+                "contains_metals": any((e not in _ORG_OK) for e in els),
+                "size": int(st.st_size),
+                "mtime": float(st.st_mtime),
+            })
+        except Exception:
+            els = sorted(_parse_elements_from_name(p.name))
+            rows.append({
+                "path": str(p),
+                "filename": p.name,
+                "elements": els,
+                "contains_metals": any((e not in _ORG_OK) for e in els),
+                "size": None,
+                "mtime": None,
+            })
+    rows.sort(key=lambda r: (r["contains_metals"], -(len(r["elements"])), r["filename"]))
+    return rows
+
+def _score_file_for_elements(want: Set[str], inferred: Set[str], metal_file: bool) -> int:
+    overlap = len(want & inferred)
+    extra = len(inferred - want)
+    score = overlap * 100 - extra * 2
+    if want and want.issubset(inferred):
+        score += 25
+
+    organic_only = all(e in _ORG_OK for e in want)
+    if organic_only and metal_file:
+        score -= 10_000
+    if want <= {"C","H","O"}:
+        score += 1
+    if len(inferred) == 0:
+        score = max(score, 50)
+    return score
+
+def candidates_for_elements(elements: Iterable[str], ff_dir: Optional[Path] = None) -> List[Tuple[str, List[str]]]:
+    d = _default_ff_dir(ff_dir)
+    want: Set[str] = {str(e).capitalize() for e in elements}
+    rows = scan_potentials_dir(d)
+
+    scored: List[Tuple[int, str, bool]] = []
+    for r in rows:
+        inferred = set(r.get("elements", []))
+        metal_file = bool(r.get("contains_metals", False))
+        s = _score_file_for_elements(want, inferred, metal_file)
+        scored.append((s, r["path"], metal_file))
+
+    scored.sort(key=lambda t: (-t[0], t[1]))
+
+    if all(e in _ORG_OK for e in want):
+        nonmetal = [(s, p) for (s, p, m) in scored if not m]
+        if nonmetal:
+            ranked = nonmetal
+        else:
+            ranked = [(s, p) for (s, p, m) in scored]
+    else:
+        ranked = [(s, p) for (s, p, m) in scored]
+
+    order = sorted(want)
+    positives = [(p, order) for (s, p) in ranked if s > 0]
+    if positives:
+        return positives
+    return [(ranked[0][1], order)] if ranked else []
+
+def pick_ffield(elements: Iterable[str], ff_dir: Optional[Path] = None) -> Tuple[str, List[str]]:
+    cands = candidates_for_elements(elements, ff_dir)
+    if not cands:
+        d = _default_ff_dir(ff_dir)
+        raise FileNotFoundError(f"No ReaxFF potential found in {d}")
+    return cands[0]
