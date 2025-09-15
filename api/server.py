@@ -14,6 +14,7 @@ from utilities.config import (
 )
 from utilities.radii import vdw_radius
 from utilities.identify import identify_from_atoms
+from utilities.connectivity import summarize_topology
 
 from simulation.system import System
 from simulation.integrators import VerletIntegrator
@@ -22,7 +23,6 @@ from simulation.engine_core import EngineCore
 
 from utilities import status as status_util
 from utilities import discord_webhook as dwh
-
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("server")
@@ -260,7 +260,7 @@ def simulate() -> Response:
         log.exception("simulation failed")
         return _error("simulation failed", 500)
 
-    frames = []
+    frames: List[Dict[str, Any]] = []
     for r in results[::report_stride]:
         frame: Dict[str, Any] = {
             "step": r.step,
@@ -306,34 +306,20 @@ def simulate() -> Response:
             "temperature": "K",
         })
 
-    include_identity = _as_bool(payload.get("include_identity"), True)
-    allow_online_names = _as_bool(payload.get("allow_online_names"), False)
-    identity = None
-    if include_identity:
-        try:
-            if frames and "positions" in frames[0]:
-                pos0 = frames[0]["positions"]
-                id_atoms = [
-                    {
-                        "element": atoms_json[i]["element"],
-                        "position": pos0[i],
-                        "properties": (atoms_json[i].get("properties") or {}),
-                    }
-                    for i in range(len(atoms_json))
-                ]
-            else:
-                id_atoms = [
-                    {
-                        "element": a["element"],
-                        "position": a["position"],
-                        "properties": (a.get("properties") or {}),
-                    }
-                    for a in atoms_json
-                ]
-            identity = identify_from_atoms(id_atoms, allow_online=allow_online_names)
-        except Exception as e:
-            log.warning("identity failed: %s", e)
-            identity = None
+    out_topology = None
+    last_coords = None
+    symbols = [a["element"] for a in atoms_json]
+
+    try:
+        if results:
+            last_coords = results[-1].positions
+        elif frames:
+            last_coords = frames[-1]["positions"]
+        if last_coords is not None:
+            out_topology = summarize_topology(symbols, last_coords, distance_scale=1.2)
+    except Exception as e:
+        log.warning("failed to build out_topology: %s", e)
+        out_topology = None
 
     resp: Dict[str, Any] = {
         "status": "success",
@@ -342,8 +328,34 @@ def simulate() -> Response:
         "atom_radii_A": radii,
         "trajectory": frames,
     }
-    if identity:
-        resp["identity"] = identity
+
+    if out_topology:
+        resp["out_topology"] = out_topology
+        resp["fragments"] = len(out_topology.get("components", []))
+        if resp["fragments"] == 1:
+            comp0 = out_topology["components"][0]
+            resp["identity"] = comp0["identity"]
+            resp["formula"]  = comp0["formula"]
+
+    include_identity = _as_bool(payload.get("include_identity"), True)
+    allow_online_names = _as_bool(payload.get("allow_online_names"), False)
+    if include_identity and allow_online_names and last_coords is not None:
+        try:
+            id_atoms = [
+                {
+                    "element": atoms_json[i]["element"],
+                    "position": (last_coords[i].tolist()
+                                 if hasattr(last_coords[i], "tolist")
+                                 else list(last_coords[i])),
+                    "properties": (atoms_json[i].get("properties") or {}),
+                }
+                for i in range(len(atoms_json))
+            ]
+            pretty_name = identify_from_atoms(id_atoms, allow_online=True)
+            if pretty_name:
+                resp["identity_name"] = pretty_name
+        except Exception as e:
+            log.warning("identity_name failed: %s", e)
 
     try:
         if DISCORD_WEBHOOK_URL and WEBHOOK_ON_SIMULATE:
