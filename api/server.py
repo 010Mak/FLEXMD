@@ -10,7 +10,8 @@ from flask import Flask, jsonify, request, Response, send_from_directory
 from utilities.config import (
     RUN_HOST, RUN_PORT, DEBUG, DEFAULT_BACKEND, DEFAULT_TIMESTEP_PS, FORCEFIELD_DIR,
     BACKENDS, MAX_ATOMS, MAX_STEPS, MAX_REPORT_FRAMES, MAX_REQUEST_BYTES,
-    DISCORD_WEBHOOK_URL, WEBHOOK_ON_STARTUP, WEBHOOK_ON_SIMULATE, SERVER_NAME, SERVER_LOCATION
+    DISCORD_WEBHOOK_URL, WEBHOOK_ON_STARTUP, WEBHOOK_ON_SIMULATE, SERVER_NAME, SERVER_LOCATION,
+    REAXFF_MAX_DT_PS,
 )
 from utilities.radii import vdw_radius
 from utilities.identify import identify_from_atoms
@@ -85,6 +86,7 @@ def _limit_size():
 
 _STARTUP_WEBHOOK_SENT = False
 
+
 def _send_startup_webhook():
     try:
         if DISCORD_WEBHOOK_URL and WEBHOOK_ON_STARTUP:
@@ -94,6 +96,7 @@ def _send_startup_webhook():
             log.info("startup webhook posted")
     except Exception as e:
         log.warning("startup webhook failed: %s", e)
+
 
 if hasattr(app, "before_serving"):
     @app.before_serving
@@ -150,7 +153,7 @@ def demo_examples() -> Response:
 
 @app.get("/demo/examples/<name>")
 def demo_example(name: str) -> Response:
-    name = name.lower()
+    name = (name or "").lower()
     if name == "methane":
         atoms = [
             {"element": "C", "position": [0.0, 0.0, 0.0]},
@@ -214,8 +217,8 @@ def simulate() -> Response:
         return _error(f"invalid backend '{backend}'", 400)
 
     dt_ps = float(payload.get("timestep_ps", DEFAULT_TIMESTEP_PS))
-    if backend == "reaxff" and dt_ps > 0.001:
-        return _error("reaxff timestep too large: use <= 0.001 ps (e.g., 0.00025 ps)", 400)
+    if backend == "reaxff" and dt_ps > REAXFF_MAX_DT_PS:
+        return _error(f"reaxff timestep too large: use <= {REAXFF_MAX_DT_PS} ps (e.g., 0.00025 ps)", 400)
 
     n_steps = int(payload.get("n_steps", 1))
     if n_steps < 1 or n_steps > MAX_STEPS:
@@ -229,6 +232,11 @@ def simulate() -> Response:
         report_stride = math.ceil(n_steps / MAX_REPORT_FRAMES)
         stride_adjusted = True
 
+    include_thermo = _as_bool(payload.get("include_thermo"), False)
+    include_identity = _as_bool(payload.get("include_identity"), False)
+    allow_online_names = _as_bool(payload.get("allow_online_names"), False)
+    include_render_hints = _as_bool(payload.get("include_render_hints"), False)
+
     system = System.from_json(atoms_json)
     integrator = VerletIntegrator(timestep=dt_ps)
 
@@ -239,7 +247,6 @@ def simulate() -> Response:
         thermostat = LangevinThermostat(target_temp=default_temp, friction=friction)
 
     plugin_args = dict(payload.get("plugin_args", {}))
-    include_thermo = _as_bool(payload.get("include_thermo"), False)
 
     try:
         engine = EngineCore.from_config(
@@ -299,81 +306,46 @@ def simulate() -> Response:
     if sel_ff:
         meta["selected_forcefield_file"] = str(sel_ff)
 
-    if include_thermo:
-        meta["units"].update({
-            "kinetic_energy": "kcal/mol",
-            "total_energy": "kcal/mol",
-            "temperature": "K",
-        })
+    render_hints = None
+    if include_render_hints:
+        try:
+            rh = getattr(engine.plugin, "render_hints", None)
+            if callable(rh):
+                render_hints = rh()
+            elif rh is not None:
+                render_hints = rh
+        except Exception as e:
+            log.debug("render_hints unavailable: %s", e)
+            render_hints = None
 
-    out_topology = None
-    last_coords = None
-    symbols = [a["element"] for a in atoms_json]
+    identity = None
+    if include_identity:
+        try:
+            identity = identify_from_atoms(atoms_json, allow_online=allow_online_names)
+        except Exception as e:
+            log.warning("identity failed: %s", e)
+            identity = None
 
-    try:
-        if results:
-            last_coords = results[-1].positions
-        elif frames:
-            last_coords = frames[-1]["positions"]
-        if last_coords is not None:
-            out_topology = summarize_topology(symbols, last_coords, distance_scale=1.2)
-    except Exception as e:
-        log.warning("failed to build out_topology: %s", e)
-        out_topology = None
-
-    resp: Dict[str, Any] = {
+    resp_payload: Dict[str, Any] = {
         "status": "success",
-        "meta": meta,
+        "trajectory": frames,
         "atoms": atoms_out,
         "atom_radii_A": radii,
-        "trajectory": frames,
+        "meta": meta,
     }
-
-    if out_topology:
-        resp["out_topology"] = out_topology
-        resp["fragments"] = len(out_topology.get("components", []))
-        if resp["fragments"] == 1:
-            comp0 = out_topology["components"][0]
-            resp["identity"] = comp0["identity"]
-            resp["formula"]  = comp0["formula"]
-
-    include_identity = _as_bool(payload.get("include_identity"), True)
-    allow_online_names = _as_bool(payload.get("allow_online_names"), False)
-    if include_identity and allow_online_names and last_coords is not None:
-        try:
-            id_atoms = [
-                {
-                    "element": atoms_json[i]["element"],
-                    "position": (last_coords[i].tolist()
-                                 if hasattr(last_coords[i], "tolist")
-                                 else list(last_coords[i])),
-                    "properties": (atoms_json[i].get("properties") or {}),
-                }
-                for i in range(len(atoms_json))
-            ]
-            pretty_name = identify_from_atoms(id_atoms, allow_online=True)
-            if pretty_name:
-                resp["identity_name"] = pretty_name
-        except Exception as e:
-            log.warning("identity_name failed: %s", e)
+    if identity is not None:
+        resp_payload["identity"] = identity
+    if render_hints is not None:
+        resp_payload["render_hints"] = render_hints
 
     try:
         if DISCORD_WEBHOOK_URL and WEBHOOK_ON_SIMULATE:
-            meta_for_embed = {
-                "selected_backend": getattr(engine.plugin, "NAME", backend),
-                "n_atoms": len(atoms_json),
-                "n_steps": n_steps,
-                "timestep_ps": dt_ps,
-                "report_stride": report_stride,
-                "report_stride_was_adjusted": stride_adjusted,
-            }
-            dwh.post(DISCORD_WEBHOOK_URL, embeds=[dwh.simulate_embed(meta_for_embed)])
+            pass
     except Exception as e:
-        log.warning("simulate webhook failed: %s", e)
+        log.debug("simulate webhook skipped: %s", e)
 
-    return jsonify(resp), 200
+    return jsonify(resp_payload), 200
 
 
 if __name__ == "__main__":
-    FORCEFIELD_DIR.mkdir(parents=True, exist_ok=True)
     app.run(host=RUN_HOST, port=RUN_PORT, debug=DEBUG)

@@ -14,8 +14,8 @@ from simulation.plugin_interface import ForceCalculator
 from simulation.system import System
 from utilities.radii import covalent_radius
 
-_KJNM_TO_KCALA = 0.0239005736
-_KJ_TO_KCAL = 0.239005736
+_KJNM_TO_KCALA = 2.39005736
+_KJ_TO_KCAL    = 0.239005736
 
 _log = logging.getLogger(__name__)
 
@@ -39,7 +39,7 @@ class SMIRNOFFPlugin(ForceCalculator):
     def __init__(
         self,
         ff_xml: str = "openff-2.0.0.offxml",
-        timestep_ps: float = 0.002,
+        timestep_ps: float = 0.001,
         partial_charge_method: str | None = None,
         charge: int | None = None,
         fallback_connectivity: bool = True,
@@ -61,6 +61,7 @@ class SMIRNOFFPlugin(ForceCalculator):
         self.fallback_connectivity = bool(fallback_connectivity)
         self.distance_scale = float(distance_scale)
 
+        self._rd_bonds: list[tuple[int,int]] = []
 
     def set_timestep_ps(self, dt_ps: float) -> None:
         self.dt = float(dt_ps) * unit.picoseconds
@@ -181,21 +182,16 @@ class SMIRNOFFPlugin(ForceCalculator):
                 return f
         return None
 
-    def _strip_constraints_and_patch_bonds(
-        self, system: openmm.System, rdmol, coords_ang: np.ndarray
-    ) -> openmm.System:
+    @staticmethod
+    def _remove_all_constraints(system: openmm.System) -> int:
         n0 = system.getNumConstraints()
-        if n0 > 0:
-            try:
-                for idx in reversed(range(n0)):
-                    system.removeConstraint(idx)
-                _log.info(
-                    "OpenMM constraints removed via API; now constraints=%d",
-                    system.getNumConstraints(),
-                )
-            except Exception as e:
-                _log.warning("Failed to remove constraints via API: %s", e)
+        for idx in reversed(range(n0)):
+            system.removeConstraint(idx)
+        return n0
 
+    def _inject_harmonic_bonds_for_rdkit(
+        self, system: openmm.System, rdmol, coords_ang: np.ndarray
+    ) -> int:
         hb = self._get_harmonic_bond_force(system)
         if hb is None:
             hb = openmm.HarmonicBondForce()
@@ -204,38 +200,37 @@ class SMIRNOFFPlugin(ForceCalculator):
         existing_pairs = set()
         for n in range(hb.getNumBonds()):
             i, j, _, _ = hb.getBondParameters(n)
-            existing_pairs.add((min(i, j), max(i, j)))
-
-        constrained_pairs = set()
-        for n in range(system.getNumConstraints()):
-            i, j, _ = system.getConstraintParameters(n)
-            constrained_pairs.add((min(i, j), max(i, j)))
+            existing_pairs.add((min(int(i), int(j)), max(int(i), int(j))))
 
         coords_nm = coords_ang * 0.1
         added = 0
+        rd_pairs: list[tuple[int,int]] = []
         for b in rdmol.GetBonds():
-            i = b.GetBeginAtomIdx()
-            j = b.GetEndAtomIdx()
+            ai = b.GetBeginAtom()
+            aj = b.GetEndAtom()
+            i = int(ai.GetIdx()); j = int(aj.GetIdx())
+            rd_pairs.append((i, j))
             key = (min(i, j), max(i, j))
-            if key in existing_pairs or key in constrained_pairs:
+            if key in existing_pairs:
                 continue
 
             dij_nm = float(np.linalg.norm(coords_nm[i] - coords_nm[j]))
             r0_nm = dij_nm if (np.isfinite(dij_nm) and dij_nm >= 1e-6) else 0.101
 
-            k_val = (
-                300.0 * unit.kilocalories_per_mole / (unit.angstrom ** 2)
-            ).value_in_unit(unit.kilojoule_per_mole / (unit.nanometer ** 2))
+            si = ai.GetSymbol(); sj = aj.GetSymbol()
+            kcal_per_A2 = 300.0 if ("H" in (si, sj)) else 200.0
+            k_val = (kcal_per_A2 * unit.kilocalories_per_mole / (unit.angstrom ** 2)
+                    ).value_in_unit(unit.kilojoule_per_mole / (unit.nanometer ** 2))
 
-            hb.addBond(int(i), int(j), r0_nm, k_val)
+            hb.addBond(i, j, r0_nm, k_val)
             added += 1
 
         _log.info(
-            "OpenMM system summary after patch: bonds(Harmonic)=%d (+%d), constraints=%d",
-            hb.getNumBonds(), added, system.getNumConstraints()
+            "Injected %d harmonic bonds (total=%d); constraints now=%d",
+            added, hb.getNumBonds(), system.getNumConstraints()
         )
-        return system
-
+        self._rd_bonds = rd_pairs
+        return added
 
     def initialize(self, system: System) -> None:
         rdmol, mode, n_bonds_rd, netq = self._rdkit_from_system(system)
@@ -265,28 +260,16 @@ class SMIRNOFFPlugin(ForceCalculator):
 
         tried = []
         sys_omm: openmm.System | None = None
-
         if charges_set:
-            kwargs_A = {"charge_from_molecules": [offmol]}
-            tried.append(kwargs_A)
-        else:
-            kwargs_A = {}
-
-        if charges_set:
-            kwargs_B = {"charge_from_molecule": offmol}
-            tried.append(kwargs_B)
-
-        kwargs_C = {}
-        tried.append(kwargs_C)
+            tried.append({"charge_from_molecules": [offmol]})
+            tried.append({"charge_from_molecule": offmol})
+        tried.append({})
 
         last_err: Exception | None = None
         for kw in tried:
             try:
                 sys_omm = self.ff.create_openmm_system(topo, **kw)
                 break
-            except TypeError as e:
-                last_err = e
-                continue
             except Exception as e:
                 last_err = e
                 continue
@@ -294,21 +277,16 @@ class SMIRNOFFPlugin(ForceCalculator):
         if sys_omm is None:
             raise RuntimeError(f"failed to create OpenMM system from OpenFF: {last_err}")
 
-        hb_before = self._get_harmonic_bond_force(sys_omm)
-        hb_n_before = hb_before.getNumBonds() if hb_before is not None else 0
-        if hb_n_before == 0 and n_bonds_rd > 0:
-            _log.warning(
-                "OpenMM system has 0 harmonic bonds despite RDKit bonds=%d. Will inject bonds.",
-                n_bonds_rd,
-            )
+        removed = self._remove_all_constraints(sys_omm)
+        if removed > 0:
+            _log.info("Removed %d OpenMM constraints to match external integration.", removed)
 
-        sys_omm = self._strip_constraints_and_patch_bonds(sys_omm, rdmol, coords_ang)
+        self._inject_harmonic_bonds_for_rdkit(sys_omm, rdmol, coords_ang)
 
-        hb_after = self._get_harmonic_bond_force(sys_omm)
-        hb_n_after = hb_after.getNumBonds() if hb_after is not None else 0
         _log.info(
-            "OpenMM system ready: Harmonic bonds=%d, constraints=%d",
-            hb_n_after, sys_omm.getNumConstraints()
+            "OpenMM system ready: Harmonic bonds=%s, constraints=%s",
+            next((f.getNumBonds() for f in sys_omm.getForces() if isinstance(f, openmm.HarmonicBondForce)), 0),
+            sys_omm.getNumConstraints()
         )
 
         self.system_omm = sys_omm
@@ -327,3 +305,6 @@ class SMIRNOFFPlugin(ForceCalculator):
         state = self.context.getState(getEnergy=True)
         e_kj = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
         return float(e_kj) * _KJ_TO_KCAL
+
+    def render_hints(self) -> dict[str, Any]:
+        return {"bonds": [[int(i), int(j)] for (i, j) in self._rd_bonds]}
