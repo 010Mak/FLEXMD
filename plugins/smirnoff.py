@@ -14,8 +14,9 @@ from simulation.plugin_interface import ForceCalculator
 from simulation.system import System
 from utilities.radii import covalent_radius
 
-_KJNM_TO_KCALA = 2.39005736
-_KJ_TO_KCAL    = 0.239005736
+_KJ_TO_KCAL            = 0.2390057361376673
+_NM_TO_A               = 10.0
+_KJNM_TO_KCALA         = _KJ_TO_KCAL / _NM_TO_A
 
 _log = logging.getLogger(__name__)
 
@@ -61,7 +62,7 @@ class SMIRNOFFPlugin(ForceCalculator):
         self.fallback_connectivity = bool(fallback_connectivity)
         self.distance_scale = float(distance_scale)
 
-        self._rd_bonds: list[tuple[int,int]] = []
+        self._rd_bonds: list[tuple[int, int]] = []
 
     def set_timestep_ps(self, dt_ps: float) -> None:
         self.dt = float(dt_ps) * unit.picoseconds
@@ -109,7 +110,8 @@ class SMIRNOFFPlugin(ForceCalculator):
             Chem.SanitizeMol(mol)
         except Exception:
             try:
-                Chem.SanitizeMol(mol, sanitizeOps=Chem.SanitizeFlags.SANITIZE_FINDRADICALS)
+                from rdkit import Chem as _Chem
+                Chem.SanitizeMol(mol, sanitizeOps=_Chem.SanitizeFlags.SANITIZE_FINDRADICALS)
             except Exception:
                 pass
         return mol
@@ -145,7 +147,8 @@ class SMIRNOFFPlugin(ForceCalculator):
                 Chem.SanitizeMol(mol)
             except Exception:
                 try:
-                    Chem.SanitizeMol(mol, sanitizeOps=Chem.SanitizeFlags.SANITIZE_FINDRADICALS)
+                    from rdkit import Chem as _Chem
+                    Chem.SanitizeMol(mol, sanitizeOps=_Chem.SanitizeFlags.SANITIZE_FINDRADICALS)
                 except Exception:
                     pass
             mode = "explicit"
@@ -202,9 +205,9 @@ class SMIRNOFFPlugin(ForceCalculator):
             i, j, _, _ = hb.getBondParameters(n)
             existing_pairs.add((min(int(i), int(j)), max(int(i), int(j))))
 
-        coords_nm = coords_ang * 0.1
+        coords_nm = coords_ang * (1.0 / _NM_TO_A)
         added = 0
-        rd_pairs: list[tuple[int,int]] = []
+        rd_pairs: list[tuple[int, int]] = []
         for b in rdmol.GetBonds():
             ai = b.GetBeginAtom()
             aj = b.GetEndAtom()
@@ -220,7 +223,7 @@ class SMIRNOFFPlugin(ForceCalculator):
             si = ai.GetSymbol(); sj = aj.GetSymbol()
             kcal_per_A2 = 300.0 if ("H" in (si, sj)) else 200.0
             k_val = (kcal_per_A2 * unit.kilocalories_per_mole / (unit.angstrom ** 2)
-                    ).value_in_unit(unit.kilojoule_per_mole / (unit.nanometer ** 2))
+                     ).value_in_unit(unit.kilojoule_per_mole / (unit.nanometer ** 2))
 
             hb.addBond(i, j, r0_nm, k_val)
             added += 1
@@ -239,7 +242,7 @@ class SMIRNOFFPlugin(ForceCalculator):
 
         coords_ang = np.asarray([atom.position for atom in system.atoms], dtype=float)
         if not offmol.conformers:
-            offmol.add_conformer((coords_ang * 0.1) * unit.nanometer)
+            offmol.add_conformer((coords_ang * (1.0 / _NM_TO_A)) * unit.nanometer)
 
         charges_set = False
         if self.charge_method:
@@ -285,7 +288,8 @@ class SMIRNOFFPlugin(ForceCalculator):
 
         _log.info(
             "OpenMM system ready: Harmonic bonds=%s, constraints=%s",
-            next((f.getNumBonds() for f in sys_omm.getForces() if isinstance(f, openmm.HarmonicBondForce)), 0),
+            next((f.getNumBonds() for f in sys_omm.getForces()
+                  if isinstance(f, openmm.HarmonicBondForce)), 0),
             sys_omm.getNumConstraints()
         )
 
@@ -293,15 +297,28 @@ class SMIRNOFFPlugin(ForceCalculator):
         self.context = openmm.Context(self.system_omm, self.integrator)
 
     def compute_forces(self, system: System) -> np.ndarray:
+        if self.context is None:
+            raise RuntimeError("SMIRNOFFPlugin not initialized")
+
         coords_ang = np.asarray([atom.position for atom in system.atoms], dtype=float)
-        self.context.setPositions((coords_ang * 0.1) * unit.nanometer)
+        self.context.setPositions((coords_ang * (1.0 / _NM_TO_A)) * unit.nanometer)
+
+        vels = getattr(system, "velocities", None)
+        if vels is not None:
+            vels_nm_ps = np.asarray(vels, dtype=float) * (1.0 / _NM_TO_A)
+            self.context.setVelocities(vels_nm_ps * (unit.nanometer / unit.picosecond))
+
         state = self.context.getState(getForces=True)
-        f_kj_nm = state.getForces(asNumpy=True).value_in_unit(
+        f_kj_per_mol_per_nm = state.getForces(asNumpy=True).value_in_unit(
             unit.kilojoule_per_mole / unit.nanometer
         )
-        return np.asarray(f_kj_nm) * _KJNM_TO_KCALA
+        f_kcal_per_mol_per_A = np.asarray(f_kj_per_mol_per_nm, dtype=float) * _KJNM_TO_KCALA
+        return f_kcal_per_mol_per_A
 
     def compute_energy(self, system: System) -> float:
+
+        if self.context is None:
+            raise RuntimeError("SMIRNOFFPlugin not initialized")
         state = self.context.getState(getEnergy=True)
         e_kj = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
         return float(e_kj) * _KJ_TO_KCAL
