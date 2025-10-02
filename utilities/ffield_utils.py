@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import os
 import re
 from pathlib import Path
@@ -100,19 +101,20 @@ def scan_potentials_dir(ff_dir: Optional[Path] = None) -> List[Dict[str, object]
     return rows
 
 def _score_file_for_elements(want: Set[str], inferred: Set[str], metal_file: bool) -> int:
-    overlap = len(want & inferred)
-    extra = len(inferred - want)
-    score = overlap * 100 - extra * 2
-    if want and want.issubset(inferred):
-        score += 25
+    if not want.issubset(inferred):
+        return -10_000
+
+    extras = len(inferred - want)
+    score = len(want) * 100
+    score -= extras * 5
 
     organic_only = all(e in _ORG_OK for e in want)
     if organic_only and metal_file:
-        score -= 10_000
-    if want <= {"C","H","O"}:
+        score -= 500
+
+    if want <= {"C", "H", "O"}:
         score += 1
-    if len(inferred) == 0:
-        score = max(score, 50)
+
     return score
 
 def candidates_for_elements(elements: Iterable[str], ff_dir: Optional[Path] = None) -> List[Tuple[str, List[str]]]:
@@ -120,33 +122,30 @@ def candidates_for_elements(elements: Iterable[str], ff_dir: Optional[Path] = No
     want: Set[str] = {str(e).capitalize() for e in elements}
     rows = scan_potentials_dir(d)
 
-    scored: List[Tuple[int, str, bool]] = []
+    coverers: List[Tuple[int, str, bool]] = []
     for r in rows:
         inferred = set(r.get("elements", []))
         metal_file = bool(r.get("contains_metals", False))
         s = _score_file_for_elements(want, inferred, metal_file)
-        scored.append((s, r["path"], metal_file))
+        if s > -10_000:
+            coverers.append((s, r["path"], metal_file))
 
-    scored.sort(key=lambda t: (-t[0], t[1]))
+    if not coverers:
+        return []
 
+    coverers.sort(key=lambda t: (-t[0], t[1]))
     if all(e in _ORG_OK for e in want):
-        nonmetal = [(s, p) for (s, p, m) in scored if not m]
-        if nonmetal:
-            ranked = nonmetal
-        else:
-            ranked = [(s, p) for (s, p, m) in scored]
+        ordered = [(s, p) for (s, p, m) in coverers if not m] or [(s, p) for (s, p, m) in coverers]
     else:
-        ranked = [(s, p) for (s, p, m) in scored]
+        ordered = [(s, p) for (s, p, m) in coverers]
 
     order = sorted(want)
-    positives = [(p, order) for (s, p) in ranked if s > 0]
-    if positives:
-        return positives
-    return [(ranked[0][1], order)] if ranked else []
+    return [(p, order) for (s, p) in ordered]
 
 def pick_ffield(elements: Iterable[str], ff_dir: Optional[Path] = None) -> Tuple[str, List[str]]:
     cands = candidates_for_elements(elements, ff_dir)
     if not cands:
         d = _default_ff_dir(ff_dir)
-        raise FileNotFoundError(f"No ReaxFF potential found in {d}")
+        want = sorted({str(e).capitalize() for e in elements})
+        raise FileNotFoundError(f"No ReaxFF potential in {d} covers elements {want}")
     return cands[0]

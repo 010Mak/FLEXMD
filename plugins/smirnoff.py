@@ -14,14 +14,15 @@ from simulation.plugin_interface import ForceCalculator
 from simulation.system import System
 from utilities.radii import covalent_radius
 
-_KJ_TO_KCAL            = 0.2390057361376673
-_NM_TO_A               = 10.0
-_KJNM_TO_KCALA         = _KJ_TO_KCAL / _NM_TO_A
+_KJ_TO_KCAL  = 0.2390057361376673
+_NM_TO_A  = 10.0
+_KJNM_TO_KCALA  = _KJ_TO_KCAL / _NM_TO_A
 
 _log = logging.getLogger(__name__)
 
 
 class SMIRNOFFPlugin(ForceCalculator):
+
     NAME = "smirnoff"
     CAPABILITY = "classical"
     MIN_ATOMS = 0
@@ -45,6 +46,8 @@ class SMIRNOFFPlugin(ForceCalculator):
         charge: int | None = None,
         fallback_connectivity: bool = True,
         distance_scale: float = 1.2,
+        forbid_hh_bonds: bool = True,
+        prune_after_determine: bool = True,
     ):
         try:
             self.ff = ForceField(ff_xml)
@@ -61,8 +64,12 @@ class SMIRNOFFPlugin(ForceCalculator):
         self.user_charge = None if charge is None else int(charge)
         self.fallback_connectivity = bool(fallback_connectivity)
         self.distance_scale = float(distance_scale)
+        self.forbid_hh_bonds = bool(forbid_hh_bonds)
+        self.prune_after_determine = bool(prune_after_determine)
 
         self._rd_bonds: list[tuple[int, int]] = []
+        self._last_elements: Tuple[str, ...] | None = None
+
 
     def set_timestep_ps(self, dt_ps: float) -> None:
         self.dt = float(dt_ps) * unit.picoseconds
@@ -79,6 +86,45 @@ class SMIRNOFFPlugin(ForceCalculator):
             elif "charge" in props:
                 tot += float(props.get("charge", 0.0))
         return int(round(tot))
+
+    def _prune_bonds_by_distance_and_hh(self, rdmol, coords_ang: np.ndarray, symbols: List[str]):
+        from rdkit import Chem
+        rw = Chem.RWMol(rdmol)
+
+        to_remove: List[Tuple[int, int]] = []
+        for b in rdmol.GetBonds():
+            i = int(b.GetBeginAtomIdx())
+            j = int(b.GetEndAtomIdx())
+            si = symbols[i].capitalize()
+            sj = symbols[j].capitalize()
+
+            if self.forbid_hh_bonds and si == "H" and sj == "H":
+                to_remove.append((i, j))
+                continue
+
+            ri = covalent_radius(si)
+            rj = covalent_radius(sj)
+            cutoff = self.distance_scale * (ri + rj)
+            d_ij = float(np.linalg.norm(coords_ang[i] - coords_ang[j]))
+            if d_ij > cutoff:
+                to_remove.append((i, j))
+
+        for i, j in to_remove:
+            try:
+                rw.RemoveBond(i, j)
+            except Exception:
+                pass
+
+        pruned = rw.GetMol()
+        try:
+            Chem.SanitizeMol(pruned)
+        except Exception:
+            try:
+                from rdkit import Chem as _Chem
+                Chem.SanitizeMol(pruned, sanitizeOps=_Chem.SanitizeFlags.SANITIZE_FINDRADICALS)
+            except Exception:
+                pass
+        return pruned
 
     def _distance_connectivity(self, natoms: int, coords: np.ndarray, symbols: List[str]):
         from rdkit import Chem
@@ -97,9 +143,13 @@ class SMIRNOFFPlugin(ForceCalculator):
 
         rw = Chem.RWMol(mol)
         for i in range(natoms):
-            ri = covalent_radius(symbols[i])
+            si = symbols[i].capitalize()
+            ri = covalent_radius(si)
             for j in range(i + 1, natoms):
-                rj = covalent_radius(symbols[j])
+                sj = symbols[j].capitalize()
+                if self.forbid_hh_bonds and si == "H" and sj == "H":
+                    continue
+                rj = covalent_radius(sj)
                 cutoff = self.distance_scale * (ri + rj)
                 if float(np.linalg.norm(coords[i] - coords[j])) <= cutoff:
                     if rw.GetBondBetweenAtoms(i, j) is None:
@@ -143,6 +193,7 @@ class SMIRNOFFPlugin(ForceCalculator):
                 if rw.GetBondBetweenAtoms(i, j) is None:
                     rw.AddBond(i, j, Chem.BondType.SINGLE)
             mol = rw.GetMol()
+            mol = self._prune_bonds_by_distance_and_hh(mol, coords_ang, symbols)
             try:
                 Chem.SanitizeMol(mol)
             except Exception:
@@ -151,7 +202,7 @@ class SMIRNOFFPlugin(ForceCalculator):
                     Chem.SanitizeMol(mol, sanitizeOps=_Chem.SanitizeFlags.SANITIZE_FINDRADICALS)
                 except Exception:
                     pass
-            mode = "explicit"
+            mode = "explicit+prune"
             n_bonds = mol.GetNumBonds()
             netq = self._net_charge_from_system(system) if self.user_charge is None else self.user_charge
             _log.info("smirnoff connectivity: picked=%s bonds=%d charge=%s", mode, n_bonds, netq)
@@ -160,8 +211,17 @@ class SMIRNOFFPlugin(ForceCalculator):
         netq = self._net_charge_from_system(system) if self.user_charge is None else self.user_charge
         try:
             rdDetermineBonds.DetermineBonds(mol, charge=int(netq))
-            Chem.SanitizeMol(mol)
-            mode = "determine_bonds"
+            if self.prune_after_determine or self.forbid_hh_bonds:
+                mol = self._prune_bonds_by_distance_and_hh(mol, coords_ang, symbols)
+            try:
+                Chem.SanitizeMol(mol)
+            except Exception:
+                try:
+                    from rdkit import Chem as _Chem
+                    Chem.SanitizeMol(mol, sanitizeOps=_Chem.SanitizeFlags.SANITIZE_FINDRADICALS)
+                except Exception:
+                    pass
+            mode = "determine_bonds+prune" if (self.prune_after_determine or self.forbid_hh_bonds) else "determine_bonds"
             n_bonds = mol.GetNumBonds()
             _log.info("smirnoff connectivity: picked=%s bonds=%d charge=%s", mode, n_bonds, netq)
             return mol, mode, n_bonds, netq
@@ -235,6 +295,7 @@ class SMIRNOFFPlugin(ForceCalculator):
         self._rd_bonds = rd_pairs
         return added
 
+
     def initialize(self, system: System) -> None:
         rdmol, mode, n_bonds_rd, netq = self._rdkit_from_system(system)
 
@@ -295,8 +356,21 @@ class SMIRNOFFPlugin(ForceCalculator):
 
         self.system_omm = sys_omm
         self.context = openmm.Context(self.system_omm, self.integrator)
+        self._last_elements = tuple(a.element for a in system.atoms)
+
+    def _ensure_context_current(self, system: System) -> None:
+        need_reinit = (
+            self.context is None
+            or self.system_omm is None
+            or self.system_omm.getNumParticles() != len(system.atoms)
+            or self._last_elements != tuple(a.element for a in system.atoms)
+        )
+        if need_reinit:
+            self.initialize(system)
+
 
     def compute_forces(self, system: System) -> np.ndarray:
+        self._ensure_context_current(system)
         if self.context is None:
             raise RuntimeError("SMIRNOFFPlugin not initialized")
 
@@ -316,12 +390,15 @@ class SMIRNOFFPlugin(ForceCalculator):
         return f_kcal_per_mol_per_A
 
     def compute_energy(self, system: System) -> float:
-
+        self._ensure_context_current(system)
         if self.context is None:
             raise RuntimeError("SMIRNOFFPlugin not initialized")
         state = self.context.getState(getEnergy=True)
         e_kj = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
         return float(e_kj) * _KJ_TO_KCAL
 
+
     def render_hints(self) -> dict[str, Any]:
         return {"bonds": [[int(i), int(j)] for (i, j) in self._rd_bonds]}
+
+PLUGIN_CLASS = SMIRNOFFPlugin

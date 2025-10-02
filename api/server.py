@@ -8,14 +8,25 @@ from typing import Any, Dict, List, Tuple
 from flask import Flask, jsonify, request, Response, send_from_directory
 
 from utilities.config import (
-    RUN_HOST, RUN_PORT, DEBUG, DEFAULT_BACKEND, DEFAULT_TIMESTEP_PS, FORCEFIELD_DIR,
-    BACKENDS, MAX_ATOMS, MAX_STEPS, MAX_REPORT_FRAMES, MAX_REQUEST_BYTES,
-    DISCORD_WEBHOOK_URL, WEBHOOK_ON_STARTUP, WEBHOOK_ON_SIMULATE, SERVER_NAME, SERVER_LOCATION,
+    RUN_HOST,
+    RUN_PORT,
+    DEBUG,
+    DEFAULT_BACKEND,
+    DEFAULT_TIMESTEP_PS,
+    BACKENDS,
+    MAX_ATOMS,
+    MAX_STEPS,
+    MAX_REPORT_FRAMES,
+    MAX_REQUEST_BYTES,
+    DISCORD_WEBHOOK_URL,
+    WEBHOOK_ON_STARTUP,
+    WEBHOOK_ON_SIMULATE,
+    SERVER_NAME,
+    SERVER_LOCATION,
     REAXFF_MAX_DT_PS,
 )
 from utilities.radii import vdw_radius
 from utilities.identify import identify_from_atoms
-from utilities.connectivity import summarize_topology
 
 from simulation.system import System
 from simulation.integrators import VerletIntegrator
@@ -24,6 +35,8 @@ from simulation.engine_core import EngineCore
 
 from utilities import status as status_util
 from utilities import discord_webhook as dwh
+
+from utilities.ghs import ghs_from_inchikey
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("server")
@@ -123,14 +136,16 @@ def health() -> Response:
 def status() -> Response:
     try:
         info = status_util.gather_server_status()
-        return jsonify({
-            "status": "ok",
-            "server": info["server"],
-            "config": info["config"],
-            "plugins": info["plugins"],
-            "smirnoff": info["smirnoff"],
-            "reaxff": info["reaxff"],
-        }), 200
+        return jsonify(
+            {
+                "status": "ok",
+                "server": info["server"],
+                "config": info["config"],
+                "plugins": info["plugins"],
+                "smirnoff": info["smirnoff"],
+                "reaxff": info["reaxff"],
+            }
+        ), 200
     except Exception as e:
         log.exception("status failed")
         return _error(f"status failed: {e}", 500)
@@ -189,12 +204,32 @@ def identify() -> Response:
         payload = request.get_json(force=True) or {}
     except Exception as e:
         return _error(f"bad json: {e}", 400)
+
     atoms_json = payload.get("atoms") or []
     ok, msg = _validate_atoms(atoms_json)
     if not ok:
         return _error(msg, 400)
+
     allow_online = _as_bool(payload.get("allow_online_names"), False)
+    include_ghs = _as_bool(payload.get("include_ghs"), False)
+
     ident = identify_from_atoms(atoms_json, allow_online=allow_online)
+
+    if include_ghs:
+        ik = (ident or {}).get("inchikey")
+        try:
+            ghs = ghs_from_inchikey(ik) if ik else {"hazard_meanings": [], "hazard_label": ""}
+        except Exception as e:
+            log.warning("GHS lookup failed: %s", e)
+            ghs = {"hazard_meanings": [], "hazard_label": ""}
+
+        ident["ghs_pictograms"] = {
+            "hazard_meanings": ghs["hazard_meanings"],
+            "hazard_label": ghs["hazard_label"],
+            "source": "PubChem GHS",
+        }
+        ident["ghs_pictogram_names"] = ghs["hazard_label"]
+
     return jsonify(status="success", identity=ident), 200
 
 
@@ -236,6 +271,7 @@ def simulate() -> Response:
     include_identity = _as_bool(payload.get("include_identity"), False)
     allow_online_names = _as_bool(payload.get("allow_online_names"), False)
     include_render_hints = _as_bool(payload.get("include_render_hints"), False)
+    include_ghs = _as_bool(payload.get("include_ghs"), False)
 
     system = System.from_json(atoms_json)
     integrator = VerletIntegrator(timestep=dt_ps)
@@ -292,60 +328,67 @@ def simulate() -> Response:
     atoms_out = [{"element": a["element"]} for a in atoms_json]
     radii = [float(vdw_radius(a["element"])) for a in atoms_json]
 
+    ident = None
+    if include_identity:
+        try:
+            ident = identify_from_atoms(atoms_json, allow_online=allow_online_names)
+        except Exception as e:
+            log.warning("identity failed: %s", e)
+            ident = None
+
+        if ident and include_ghs:
+            ik = (ident or {}).get("inchikey")
+            try:
+                ghs = ghs_from_inchikey(ik) if ik else {"hazard_meanings": [], "hazard_label": ""}
+            except Exception as e:
+                log.warning("GHS lookup failed: %s", e)
+                ghs = {"hazard_meanings": [], "hazard_label": ""}
+
+            ident.setdefault("ghs_pictograms", {})
+            ident["ghs_pictograms"].update(
+                {
+                    "hazard_meanings": ghs["hazard_meanings"],
+                    "hazard_label": ghs["hazard_label"],
+                    "source": "PubChem GHS",
+                }
+            )
+            ident["ghs_pictogram_names"] = ghs["hazard_label"]
+
+    render_hints = None
+    if include_render_hints:
+        try:
+            rh = getattr(engine.plugin, "render_hints", None)
+            render_hints = rh() if callable(rh) else None
+        except Exception:
+            render_hints = None
+
     meta: Dict[str, Any] = {
         "backend_requested": backend,
         "selected_backend": getattr(engine.plugin, "NAME", "unknown"),
         "n_atoms": len(atoms_json),
         "n_steps": n_steps,
         "report_stride": report_stride,
-        "report_stride_was_adjusted": stride_adjusted,
+        "report_stride_was_adjusted": bool(stride_adjusted),
         "timestep_ps": dt_ps,
-        "units": {"length": "angstrom", "time": "ps", "energy": "kcal/mol", "force": "kcal/mol/angstrom"},
+        "units": {
+            "energy": "kcal/mol",
+            "force": "kcal/mol/angstrom",
+            "length": "angstrom",
+            "time": "ps",
+        },
+        "server": {"name": SERVER_NAME, "location": SERVER_LOCATION},
     }
-    sel_ff = getattr(engine.plugin, "selected_ff_file", None)
-    if sel_ff:
-        meta["selected_forcefield_file"] = str(sel_ff)
 
-    render_hints = None
-    if include_render_hints:
-        try:
-            rh = getattr(engine.plugin, "render_hints", None)
-            if callable(rh):
-                render_hints = rh()
-            elif rh is not None:
-                render_hints = rh
-        except Exception as e:
-            log.debug("render_hints unavailable: %s", e)
-            render_hints = None
-
-    identity = None
-    if include_identity:
-        try:
-            identity = identify_from_atoms(atoms_json, allow_online=allow_online_names)
-        except Exception as e:
-            log.warning("identity failed: %s", e)
-            identity = None
-
-    resp_payload: Dict[str, Any] = {
+    out = {
         "status": "success",
-        "trajectory": frames,
+        "meta": meta,
         "atoms": atoms_out,
         "atom_radii_A": radii,
-        "meta": meta,
+        "trajectory": frames,
     }
-    if identity is not None:
-        resp_payload["identity"] = identity
+    if ident is not None:
+        out["identity"] = ident
     if render_hints is not None:
-        resp_payload["render_hints"] = render_hints
+        out["render_hints"] = render_hints
 
-    try:
-        if DISCORD_WEBHOOK_URL and WEBHOOK_ON_SIMULATE:
-            pass
-    except Exception as e:
-        log.debug("simulate webhook skipped: %s", e)
-
-    return jsonify(resp_payload), 200
-
-
-if __name__ == "__main__":
-    app.run(host=RUN_HOST, port=RUN_PORT, debug=DEBUG)
+    return jsonify(out), 200

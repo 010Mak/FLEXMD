@@ -3,7 +3,6 @@ import numpy as np
 
 KCALMOL_PER_A_TO_A_PS2_PER_AMU = 418.4
 
-
 class BaseIntegrator:
     def __init__(self, dt_ps: float = None, *, timestep: float = None, dt: float = None, **_):
         chosen = dt_ps
@@ -72,7 +71,6 @@ class EulerIntegrator(BaseIntegrator):
 
     def post_force(self, system, forces_new: np.ndarray) -> None:
         pass
-
 
 __all__ = [
     "BaseIntegrator",
