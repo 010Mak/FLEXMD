@@ -15,6 +15,7 @@ from simulation.thermo import attach_thermo
 
 _ORGANIC = {"C", "H", "N", "O", "P", "S", "F", "Cl", "Br", "I", "B", "Si"}
 
+
 class StepResult:
     def __init__(
         self,
@@ -58,7 +59,6 @@ class StepResult:
 
 
 class EngineCore:
-
     def __init__(
         self,
         system: System,
@@ -99,6 +99,15 @@ class EngineCore:
 
         thermostat = system_kwargs.get("thermostat")
         return cls(system, integrator, plugin, thermostat)
+
+    def get_meta(self) -> Dict[str, Any]:
+        meta: Dict[str, Any] = {}
+        meta["backend"] = getattr(self.plugin, "NAME", "unknown")
+        for k in ("ffield_id", "ff_id", "ff_path", "qeq_mode", "version", "ff_version"):
+            v = getattr(self.plugin, k, None)
+            if v is not None:
+                meta[k] = v
+        return meta
 
     def _elements_sorted(self) -> List[str]:
         return sorted({str(a.element).capitalize() for a in self.system.atoms})

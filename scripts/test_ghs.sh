@@ -5,7 +5,6 @@ BASE="${BASE:-http://127.0.0.1:5000}"
 
 pp(){ if command -v jq >/dev/null 2>&1; then jq -r "$1"; else cat; fi; }
 
-# Gentle heads-up if server isn't up (don't exit)
 if ! curl -fsS "$BASE/health" >/dev/null 2>&1; then
   echo "warning: $BASE/health not reachable; is the server running?" >&2
 fi

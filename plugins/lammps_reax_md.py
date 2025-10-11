@@ -18,17 +18,21 @@ from simulation.system import System
 
 _FS_PER_PS = 1000.0
 _MAX_SAFE_DT_PS = 0.001
+
 _ENERGY_GUARD = 5.0e3
+
 _WARMUP_DT_FS = 0.10
 _WARMUP_LIMIT = 0.05
 _WARMUP_STEPS_LIMIT = 150
 _WARMUP_LANGEVIN_STEPS = 200
 _LANGEVIN_DAMP_FS = 25.0
 _LANGEVIN_SEED = 904297
+
 _CHUNK_MIN = 10
 _CHUNK_MAX = 2000
 
 _log = logging.getLogger(__name__)
+
 
 class ReaxFFPlugin(ForceCalculator):
     NAME = "reaxff"
@@ -71,7 +75,7 @@ class ReaxFFPlugin(ForceCalculator):
         self.qeq_cutlo = float(qeq_cutlo)
         self.qeq_cuthi = float(qeq_cuthi)
         self.qeq_cutoff = float(qeq_cutoff)
-        self.qeq_fix = qeq_fix.lower().strip()
+        self.qeq_fix = (qeq_fix or "auto").lower().strip()
 
         self.box_padding = float(box_padding)
         self.auto_resize_box = bool(auto_resize_box)
@@ -79,7 +83,7 @@ class ReaxFFPlugin(ForceCalculator):
         self.use_nvt = bool(use_nvt)
         self.nvt_tdamp_ps = float(nvt_tdamp_ps)
 
-        self.prefer_pair = prefer_pair.lower().strip()
+        self.prefer_pair = (prefer_pair or "auto").lower().strip()
 
         self._lmp = None
         self._tmpdir: Path | None = None
@@ -93,7 +97,7 @@ class ReaxFFPlugin(ForceCalculator):
 
     def _compute_bounds(self, positions: np.ndarray) -> Tuple[float, float, float, float, float, float]:
         mins, maxs = positions.min(axis=0), positions.max(axis=0)
-        pad = max(self.box_padding, self.qeq_cutoff + 2.0, self.qeq_cuthi + 2.0)
+        pad = max(self.box_padding, self.qeq_cutoff + 3.0, self.qeq_cuthi + 3.0)
         xlo, xhi = float(mins[0] - pad), float(maxs[0] + pad)
         ylo, yhi = float(mins[1] - pad), float(maxs[1] + pad)
         zlo, zhi = float(mins[2] - pad), float(maxs[2] + pad)
@@ -135,7 +139,7 @@ class ReaxFFPlugin(ForceCalculator):
         if inside:
             return
         if not self.auto_resize_box:
-            raise ValueError("positions exceed lammps box; enable auto_resize_box or increase box_padding")
+            raise ValueError("positions exceed LAMMPS box; enable auto_resize_box or increase box_padding")
         new_xlo, new_xhi, new_ylo, new_yhi, new_zlo, new_zhi = self._compute_bounds(positions)
         lmp = self._lmp
         assert lmp is not None
@@ -171,21 +175,22 @@ class ReaxFFPlugin(ForceCalculator):
 
     def _select_pair_style(self, lmp) -> str:
         pref = self.prefer_pair
-        try:
-            has_reaxff = bool(lmp.has_style("pair", "reaxff"))
-        except Exception:
-            has_reaxff = True
-        try:
-            has_reaxc = bool(lmp.has_style("pair", "reax/c"))
-        except Exception:
-            has_reaxc = False
+
+        def _has(style_type: str, style_name: str) -> bool:
+            try:
+                return bool(lmp.has_style(style_type, style_name))
+            except Exception:
+                return style_name in ("reaxff", "reax/c")
+
+        has_reaxff = _has("pair", "reaxff")
+        has_reaxc = _has("pair", "reax/c")
 
         if pref in ("auto", "reaxff"):
             if has_reaxff:
                 return "reaxff"
         if pref == "reax/c":
-            if has_reaxff:
-                _log.warning("prefer_pair='reax/c' requested, but 'reaxff' is available; using 'reaxff'.")
+            if has_reaxff and not has_reaxc:
+                _log.warning("prefer_pair='reax/c' requested, but only 'reaxff' is available; using 'reaxff'.")
                 return "reaxff"
             if has_reaxc:
                 return "reax/c"
@@ -196,14 +201,7 @@ class ReaxFFPlugin(ForceCalculator):
         raise RuntimeError("reaxff-compatible pair style not found (need 'reaxff' or 'reax/c').")
 
     def _choose_qeq_fix(self, lmp, pair_style: str) -> str:
-        explicit = self.qeq_fix
-        if pair_style == "reaxff":
-            if explicit in ("", "auto", "none"):
-                return "none"
-            _log.warning(
-                "qeq_fix=%s requested with pair_style=reaxff; skipping to avoid double QEq.", explicit
-            )
-            return "none"
+        explicit = (self.qeq_fix or "auto").lower().strip()
 
         def have(style: str) -> bool:
             try:
@@ -211,20 +209,26 @@ class ReaxFFPlugin(ForceCalculator):
             except Exception:
                 return style in ("qeq/reaxff", "acks2/reaxff", "qeq/shielded")
 
-        if explicit in ("reaxff", "acks2", "shielded"):
-            desired = {
-                "reaxff": "qeq/reaxff",
-                "acks2": "acks2/reaxff",
-                "shielded": "qeq/shielded",
-            }[explicit]
-            if have(desired):
-                return desired
-            raise RuntimeError(f"requested qeq fix '{desired}' not available in this LAMMPS build")
+        def _map_choice(val: str) -> str | None:
+            if val == "reaxff":
+                return "qeq/reaxff"
+            if val == "acks2":
+                return "acks2/reaxff"
+            if val == "shielded":
+                return "qeq/shielded"
+            return None
 
-        for fx in ("qeq/reaxff", "acks2/reaxff", "qeq/shielded"):
+        if explicit not in ("", "auto", "none"):
+            desired = _map_choice(explicit)
+            if desired and have(desired):
+                return desired
+            raise RuntimeError(f"requested qeq fix '{explicit}' not available in this LAMMPS build")
+
+        for fx in ("qeq/shielded", "qeq/reaxff", "acks2/reaxff"):
             if have(fx):
                 return fx
-        raise RuntimeError("no suitable qeq fix available for reax/c (need qeq/reaxff or acks2/reaxff or qeq/shielded)")
+
+        raise RuntimeError("no suitable QEq fix available (need qeq/shielded or qeq/reaxff or acks2/reaxff)")
 
     def _install_qeq_fix(self, lmp, qeq_style: str, pair_style: str) -> None:
         if self._have_fq:
@@ -233,9 +237,6 @@ class ReaxFFPlugin(ForceCalculator):
             except Exception:
                 pass
             self._have_fq = False
-
-        if qeq_style == "none":
-            return
 
         if qeq_style == "qeq/shielded":
             lmp.command(
@@ -259,7 +260,7 @@ class ReaxFFPlugin(ForceCalculator):
             "units real",
             "atom_style charge",
             "atom_modify map array",
-            "boundary s s s",
+            "boundary f f f",
             f"read_data {self._data_file}",
             "neighbor 2.0 bin",
             "neigh_modify every 1 delay 0 check yes one 10000 page 100000",
@@ -271,6 +272,7 @@ class ReaxFFPlugin(ForceCalculator):
             lmp.command("pair_style reax/c NULL")
         else:
             lmp.command("pair_style reaxff NULL")
+
         symbols = " ".join(order)
         lmp.command(f"pair_coeff * * {ff_file} {symbols}")
 
@@ -413,22 +415,21 @@ class ReaxFFPlugin(ForceCalculator):
         e = float(lmp.extract_compute("cpe", 0, 0))
         if (not math.isfinite(e)) or (abs(e) > _ENERGY_GUARD):
             _log.warning("initial run0 energy looks bad (E=%g); considering QEq fallback", e)
-            if (self._pair_style or "reaxff") == "reax/c":
-                current_pair = "reax/c"
-                tried = set()
-                for alt in ("qeq/reaxff", "acks2/reaxff", "qeq/shielded"):
-                    if alt in tried:
-                        continue
-                    tried.add(alt)
-                    try:
-                        self._install_qeq_fix(lmp, alt, current_pair)
-                        lmp.command("run 0 post yes")
-                        e2 = float(lmp.extract_compute("cpe", 0, 0))
-                        _log.info("QEq retry with %s gave E=%g", alt, e2)
-                        if math.isfinite(e2) and abs(e2) <= _ENERGY_GUARD:
-                            break
-                    except Exception:
-                        continue
+            current_pair = (self._pair_style or "reaxff")
+            tried = set()
+            for alt in ("qeq/shielded", "qeq/reaxff", "acks2/reaxff"):
+                if alt in tried:
+                    continue
+                tried.add(alt)
+                try:
+                    self._install_qeq_fix(lmp, alt, current_pair)
+                    lmp.command("run 0 post yes")
+                    e2 = float(lmp.extract_compute("cpe", 0, 0))
+                    _log.info("QEq retry with %s gave E=%g", alt, e2)
+                    if math.isfinite(e2) and abs(e2) <= _ENERGY_GUARD:
+                        break
+                except Exception:
+                    continue
 
         f_ct = lmp.gather_atoms("f", 1, 3)
         forces = np.ctypeslib.as_array(f_ct, shape=(natoms * 3,)).reshape((natoms, 3)).copy()
