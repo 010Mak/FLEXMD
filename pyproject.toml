@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mmdfled"
+version = "0.2.0"
+description = "MMDFLED: a minimal molecular-dynamics micro-service with pluggable force backends (ReaxFF/OpenMM/Psi4) and a browser demo."
+readme = "README.md"
+authors = [{ name = "Mak", email = "010makdev@gmail.com" }]
+requires-python = ">=3.9,<3.13"
+
+dependencies = [
+  "flask>=2.3",
+  "numpy>=1.25",
+  "periodictable>=1.5.0",
+  "mendeleev>=0.15.0",
+]
+
+[project.optional-dependencies]
+smirnoff = [
+  "openmm>=8.1",
+  "openff-toolkit>=0.12",
+  "rdkit-pypi>=2022.9",
+]
+psi4 = [ "psi4>=1.9" ]
+identity = [ "rdkit-pypi>=2022.9" ]
+dev = [
+  "pytest>=7.0",
+  "black>=24.3.0",
+  "ruff>=0.3.0",
+  "mypy>=1.8.0",
+]
+reaxff = []
+
+[project.scripts]
+mmdfled = "main:main"
+
+[project.entry-points."mmdfled.plugins"]
+smirnoff = "plugins.smirnoff:SMIRNOFFPlugin"
+reaxff   = "plugins.lammps_reax_md:ReaxFFPlugin"
+psi4     = "plugins.psi4:Psi4Plugin"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["api", "simulation", "plugins", "utilities"]

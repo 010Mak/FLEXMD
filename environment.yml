@@ -1,0 +1,23 @@
+name: MMD
+channels:
+  - conda-forge
+channel_priority: strict
+dependencies:
+  - python=3.10
+  - pip
+  - flask=2.3.*
+  - numpy>=1.25,<2
+  - openmm=8.1.*
+  - openff-toolkit=0.12.*          
+  - rdkit=2024.09.*                 
+  - mdanalysis=2.4.*               
+  - ase=3.24.*                      
+  - periodictable=1.5.*
+  - mendeleev=0.15.*
+  - networkx=3.1
+  - sympy=1.11.*
+  - matplotlib=3.7.*
+  - psi4=1.9.1                      
+  - pip:
+      - basis_set_exchange==0.8.0   
+      - openff-plugins>=0.4,<0.5   
