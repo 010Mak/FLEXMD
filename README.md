@@ -111,7 +111,6 @@ mamba env create -f environment.yml
 mamba activate flexmd
 ```
 </details>
-
 <details><summary><strong>Option B: create manually (choose stacks you need)</strong></summary>
 
 ```bash
