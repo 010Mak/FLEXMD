@@ -15,7 +15,7 @@
 FLEXMD is a modular molecular simulation engine you can run as a **local HTTP service** or import as a **Python library**. It ships with three backend plugins:
 
 - **Classical MD** via **OpenMM** + **OpenFF (SMIRNOFF)**  
-- **_Ab initio_** single‑point/relaxation via **Psi4**  
+- Single‑point/relaxation via **Psi4**  
 - **Reactive MD** via **LAMMPS/ReaxFF** (optional plugin you enable with your own LAMMPS build)
 
 A small **plugin interface** lets you choose (or auto‑select) the best backend per system size, and a compact REST API lets you drive simulations from any client (browser, Python, curl, …).
@@ -71,7 +71,7 @@ A small **plugin interface** lets you choose (or auto‑select) the best backend
 |:--|:--|:--|
 | **`smirnoff`** (OpenMM + OpenFF) | Small–medium organic/biomolecular systems, **non‑reactive MD** | Install via **conda‑forge**. Verify with `python -m openmm.testInstallation`. |
 | **`reaxff`** (LAMMPS) | **Reactive** events (bond breaking/forming) | Your LAMMPS must be built **with REAXFF**; verify with `lmp -h` and `pair_style reaxff`. |
-| **`psi4`** (Psi4) | **_Ab initio_** energy/forces for small systems | Install via **conda‑forge** or Psi4conda; set `PSI_SCRATCH`, test with `psi4 --test`. |
+| **`psi4`** (Psi4) | Energy/forces for small systems | Install via **conda‑forge** or Psi4conda; set `PSI_SCRATCH`, test with `psi4 --test`. |
 
 > [!NOTE]
 > Installing **`openff-toolkit`** brings **RDKit** and **AmberTools** by default. Use `openff-toolkit-base` only if you want to supply those yourself.
