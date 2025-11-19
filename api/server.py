@@ -66,6 +66,7 @@ from utilities import status as status_util
 from utilities import discord_webhook as dwh
 
 from utilities.ghs import ghs_from_inchikey
+from utilities.physprops import physprops_from_inchikey, build_phase_curve_1atm
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("server")
@@ -310,7 +311,7 @@ def _build_cached_response(
 
 @app.before_request
 def _limit_size():
-    if request.path in ("/simulate", "/identify"):
+    if request.path in ("/simulate", "/identify", "/properties"):
         cl = request.content_length
         if cl is not None and cl > MAX_REQUEST_BYTES:
             return _error("request too large", 413)
@@ -450,6 +451,76 @@ def identify() -> Response:
         ident["ghs_pictogram_names"] = ghs["hazard_label"]
 
     return jsonify(status="success", identity=ident), 200
+
+
+@app.post("/properties")
+def properties() -> Response:
+    try:
+        payload = request.get_json(force=True) or {}
+    except Exception as e:
+        return _error(f"bad json: {e}", 400)
+
+    atoms_json: List[Dict[str, Any]] = payload.get("atoms") or []
+    ok, msg = _validate_atoms(atoms_json)
+    if not ok:
+        return _error(msg, 400)
+
+    allow_online = _as_bool(payload.get("allow_online_names"), False)
+
+    try:
+        phase_resolution = int(payload.get("phase_resolution", 200))
+    except Exception:
+        phase_resolution = 200
+    if phase_resolution < 3:
+        phase_resolution = 3
+
+    t_min_req = payload.get("t_min_K")
+    t_max_req = payload.get("t_max_K")
+    t_min_K = float(t_min_req) if t_min_req is not None else None
+    t_max_K = float(t_max_req) if t_max_req is not None else None
+
+    ident: Optional[Dict[str, Any]] = None
+    try:
+        ident = identify_from_atoms(atoms_json, allow_online=allow_online)
+    except Exception as e:
+        log.warning("identity failed in /properties: %s", e)
+        ident = None
+
+    props: Dict[str, Any] = {}
+    mpK: Optional[float] = None
+    bpK: Optional[float] = None
+    try:
+        ik = (ident or {}).get("inchikey")
+        if ik:
+            props = physprops_from_inchikey(ik)
+            mp = props.get("melting_point")
+            bp = props.get("boiling_point")
+            if mp and isinstance(mp.get("value_K"), (int, float)):
+                mpK = float(mp["value_K"])
+            if bp and isinstance(bp.get("value_K"), (int, float)):
+                bpK = float(bp["value_K"])
+    except Exception as e:
+        log.warning("physprops lookup failed in /properties: %s", e)
+
+    phase_diagram: Optional[Dict[str, Any]] = None
+    if mpK is not None and bpK is not None and bpK > mpK:
+        phase_diagram = build_phase_curve_1atm(
+            melting_point_K=mpK,
+            boiling_point_K=bpK,
+            t_min_K=t_min_K,
+            t_max_K=t_max_K,
+            n_points=phase_resolution,
+        )
+
+    out: Dict[str, Any] = {
+        "status": "success",
+        "identity": ident,
+        "properties": props,
+    }
+    if phase_diagram is not None:
+        out["phase_diagram"] = phase_diagram
+
+    return jsonify(out), 200
 
 
 @app.post("/simulate")
