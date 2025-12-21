@@ -21,7 +21,7 @@ def _env_bool(name: str, default: str = "0") -> bool:
     return str(os.getenv(name, default)).lower() in ("1","true","yes","on")
 
 WEBHOOK_ON_STARTUP  = _env_bool("MMDFLED_WEBHOOK_ON_STARTUP", "1" if DISCORD_WEBHOOK_URL else "0")
-WEBHOOK_ON_SIMULATE = _env_bool("MMDFLED_WEBHOOK_ON_SIMULATE", "0")
+WEBHOOK_ON_SIMULATE = _env_bool("MMDFLED_WEBHOOK_ON_SIMULATE", "1")
 
 RUN_HOST = os.getenv("MMDFLED_RUN_HOST", "0.0.0.0")
 RUN_PORT = int(os.getenv("MMDFLED_RUN_PORT", "5000"))

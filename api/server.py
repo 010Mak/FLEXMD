@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import math
 import logging
+import io
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
 import time
 import datetime
 
-from flask import Flask, jsonify, request, Response, send_from_directory
+from flask import Flask, jsonify, request, Response, send_from_directory, send_file
 
 from utilities.config import (
     RUN_HOST,
@@ -67,6 +68,13 @@ from utilities import discord_webhook as dwh
 
 from utilities.ghs import ghs_from_inchikey
 from utilities.physprops import physprops_from_inchikey, build_phase_curve_1atm
+
+try:
+    from utilities.spacefill_kit import build_spacefill_kit_zip
+    _SPACEFILL_KIT_AVAILABLE = True
+except Exception:
+    build_spacefill_kit_zip = None
+    _SPACEFILL_KIT_AVAILABLE = False
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("server")
@@ -311,7 +319,7 @@ def _build_cached_response(
 
 @app.before_request
 def _limit_size():
-    if request.path in ("/simulate", "/identify", "/properties"):
+    if request.path in ("/simulate", "/identify", "/properties", "/export/spacefill_kit"):
         cl = request.content_length
         if cl is not None and cl > MAX_REQUEST_BYTES:
             return _error("request too large", 413)
@@ -523,8 +531,107 @@ def properties() -> Response:
     return jsonify(out), 200
 
 
+@app.post("/export/spacefill_kit")
+def export_spacefill_kit() -> Response:
+    if not _SPACEFILL_KIT_AVAILABLE or build_spacefill_kit_zip is None:
+        return _error("spacefill kit exporter not installed (missing utilities/spacefill_kit.py)", 501)
+
+    try:
+        payload = request.get_json(force=True) or {}
+    except Exception as e:
+        return _error(f"bad json: {e}", 400)
+
+    atoms_json: List[Dict[str, Any]] = payload.get("atoms") or []
+    ok, msg = _validate_atoms(atoms_json)
+    if not ok:
+        return _error(msg, 400)
+    if len(atoms_json) > MAX_ATOMS:
+        return _error(f"too many atoms: {len(atoms_json)} > {MAX_ATOMS}", 400)
+
+    size = str(payload.get("size", "handheld") or "handheld").lower()
+
+    target_max_mm = payload.get("target_max_mm", None)
+    scale_mm_per_A = payload.get("scale_mm_per_A", None)
+
+    voxel_size_mm = payload.get("voxel_size_mm", None)
+    gap_mm = payload.get("gap_mm", None)
+    center = _as_bool(payload.get("center"), True)
+
+    split_mode = str(payload.get("split_mode", "element") or "element").lower()
+    label_map = payload.get("label_map", None) or {}
+    color_map = payload.get("color_map", None) or {}
+
+    include_identity = _as_bool(payload.get("include_identity"), True)
+    allow_online_names = _as_bool(payload.get("allow_online_names"), False)
+
+    post_to_discord = _as_bool(payload.get("post_to_discord"), False)
+    discord_message = str(payload.get("discord_message") or "").strip() or None
+    discord_username = str(payload.get("discord_username") or "").strip() or None
+
+    ident = None
+    if include_identity:
+        try:
+            ident = identify_from_atoms(atoms_json, allow_online=allow_online_names)
+        except Exception as e:
+            log.warning("identity failed in /export/spacefill_kit: %s", e)
+            ident = None
+
+    try:
+        kit_bytes, manifest = build_spacefill_kit_zip(
+            atoms_json=atoms_json,
+            identity=ident,
+            size=size,
+            target_max_mm=float(target_max_mm) if target_max_mm is not None else None,
+            scale_mm_per_A=float(scale_mm_per_A) if scale_mm_per_A is not None else None,
+            voxel_size_mm=float(voxel_size_mm) if voxel_size_mm is not None else None,
+            gap_mm=float(gap_mm) if gap_mm is not None else None,
+            split_mode=split_mode,
+            label_map=label_map,
+            color_map=color_map,
+            center=center,
+        )
+    except Exception as e:
+        log.exception("spacefill export failed")
+        return _error(f"spacefill export failed: {e}", 500)
+
+    filename = ((manifest.get("package") or {}).get("filename")) or "spacefill_kit.zip"
+
+    if post_to_discord and DISCORD_WEBHOOK_URL:
+        try:
+            title = None
+            if isinstance(ident, dict):
+                title = ident.get("name") or ident.get("formula")
+            embed = dwh.kit_embed(manifest, title=title)
+
+            msg = discord_message or f"{title or 'Space-fill kit'} — print kit attached."
+            dwh.post_file(
+                DISCORD_WEBHOOK_URL,
+                filename=filename,
+                file_bytes=kit_bytes,
+                content=msg,
+                embeds=[embed],
+                username=discord_username,
+                wait=True,
+                content_type="application/zip",
+                timeout_s=20,
+                raise_on_error=False,
+            )
+        except Exception as e:
+            log.warning("discord post failed (non-fatal): %s", e)
+
+    resp = send_file(
+        io.BytesIO(kit_bytes),
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name=filename,
+    )
+    return _no_store(resp)
+
+
 @app.post("/simulate")
 def simulate() -> Response:
+    t0 = time.time()
+
     try:
         payload = request.get_json(force=True) or {}
     except Exception as e:
@@ -578,7 +685,6 @@ def simulate() -> Response:
     plugin_args = dict(payload.get("plugin_args", {}) or {})
 
     cache_hit = False
-    cache_key_used: Optional[str] = None
     cached_response: Optional[Dict[str, Any]] = None
 
     cache_globally_enabled = bool(_CACHE_AVAILABLE and _CFG_CACHE_ENABLE)
@@ -634,11 +740,27 @@ def simulate() -> Response:
                     bonds_for_key=bonds_for_key,
                 )
                 cache_hit = True
-                cache_key_used = key
         except Exception as e:
             log.warning("cache lookup failed (non-fatal): %s", e)
 
     if cache_hit and cached_response:
+        if DISCORD_WEBHOOK_URL and WEBHOOK_ON_SIMULATE:
+            try:
+                dur = time.time() - t0
+                emb = dwh.simulate_embed(
+                    backend=backend,
+                    selected_backend=backend,
+                    n_atoms=len(atoms_json),
+                    n_steps=n_steps,
+                    dt_ps=dt_ps,
+                    report_stride=report_stride,
+                    cache_hit=True,
+                    result_id=str(cached_response.get("result_id") or ""),
+                    duration_s=dur,
+                )
+                dwh.post(DISCORD_WEBHOOK_URL, embeds=[emb], wait=False)
+            except Exception:
+                pass
         return jsonify(cached_response), 200
 
     system = System.from_json(atoms_json)
@@ -647,7 +769,7 @@ def simulate() -> Response:
     thermostat = None
     if thermostat_name == "langevin":
         friction = float(payload.get("friction_coeff", 1.0))
-        thermostat = LangevinThermostat(target_temp=float(default_temp or 298.0), friction=friction)
+        thermostat = LangevinThermostat(temperature_K=float(default_temp or 298.0), friction_coeff=friction)
 
     try:
         engine = EngineCore.from_config(
@@ -760,7 +882,10 @@ def simulate() -> Response:
         elif isinstance(bonds_hint, list) and bonds_hint:
             bonds_used = [(int(i), int(j)) for (i, j) in bonds_hint]
         else:
-            bonds_used = _bond_guess([{"element": e, "position": p} for e, p in zip(elements_list, last_positions or _positions_from_atoms(atoms_json))], factor=1.25)
+            bonds_used = _bond_guess(
+                [{"element": e, "position": p} for e, p in zip(elements_list, last_positions or _positions_from_atoms(atoms_json))],
+                factor=1.25
+            )
 
         ids_pkg = compute_all_ids(
             elements=elements_list,
@@ -792,7 +917,9 @@ def simulate() -> Response:
             cache_globally_enabled
             and (backend in set(_CFG_CACHE_BACKENDS or []))
             and _CFG_CACHE_MAX_ATOMS >= len(atoms_json)
-            and out.get("render_hints") and isinstance(out["render_hints"].get("bonds"), list) and out["render_hints"]["bonds"]
+            and out.get("render_hints")
+            and isinstance(out["render_hints"].get("bonds"), list)
+            and out["render_hints"]["bonds"]
             and out["cache"]["policy"] in {"write", "rw"}
         ):
             last = frames[-1] if frames else None
@@ -837,8 +964,25 @@ def simulate() -> Response:
     except Exception as e:
         log.warning("cache store skipped (non-fatal): %s", e)
 
-    return jsonify(out), 200
+    if DISCORD_WEBHOOK_URL and WEBHOOK_ON_SIMULATE:
+        try:
+            dur = time.time() - t0
+            emb = dwh.simulate_embed(
+                backend=backend,
+                selected_backend=str(meta.get("selected_backend") or backend),
+                n_atoms=len(atoms_json),
+                n_steps=n_steps,
+                dt_ps=dt_ps,
+                report_stride=report_stride,
+                cache_hit=False,
+                result_id=str(out.get("result_id") or ""),
+                duration_s=dur,
+            )
+            dwh.post(DISCORD_WEBHOOK_URL, embeds=[emb], wait=False)
+        except Exception:
+            pass
 
+    return jsonify(out), 200
 
 if __name__ == "__main__":
     app.run(host=RUN_HOST, port=RUN_PORT, debug=DEBUG)
