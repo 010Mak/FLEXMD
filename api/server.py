@@ -683,6 +683,12 @@ def simulate() -> Response:
     if thermostat_name == "langevin":
         default_temp = float(payload.get("defaultConditions", {}).get("temperature", 298.0))
     plugin_args = dict(payload.get("plugin_args", {}) or {})
+    # Map request temperature -> ReaxFF plugin temperature (LAMMPS path)
+    if backend == "reaxff" and default_temp is not None:
+        plugin_args.setdefault("temperature", float(default_temp))
+        # If caller asked for a thermostat, use LAMMPS NVT (otherwise plugin defaults to NVE)
+        plugin_args.setdefault("use_nvt", True)
+
 
     cache_hit = False
     cached_response: Optional[Dict[str, Any]] = None

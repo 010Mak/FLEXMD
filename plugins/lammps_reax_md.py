@@ -381,6 +381,7 @@ class ReaxFFPlugin(ForceCalculator):
         f_ct = lmp.gather_atoms("f", 1, 3)
         x = np.ctypeslib.as_array(x_ct, shape=(natoms * 3,)).reshape((natoms, 3)).copy()
         v = np.ctypeslib.as_array(v_ct, shape=(natoms * 3,)).reshape((natoms, 3)).copy()
+        v *= _FS_PER_PS  # LAMMPS real units: Å/fs -> Å/ps
         f = np.ctypeslib.as_array(f_ct, shape=(natoms * 3,)).reshape((natoms, 3)).copy()
         e = float(lmp.extract_compute("cpe", 0, 0))
         return x, v, f, e
